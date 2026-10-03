@@ -4,13 +4,17 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** awaiting-manual-validation
 
-- [ ] Daemon start, status, and stop work through the CLI and local HTTP interface, with clear output and exit behavior.
-- [ ] The daemon listens only on loopback and initializes persistent SQLite storage with schema migration tracking.
-- [ ] Repeated start succeeds for a healthy daemon without launching another instance. An unresponsive existing instance is reported rather than silently replaced.
-- [ ] Stop shuts down the daemon cleanly and is safe to repeat. Agent terminals, when later supported, are not terminated by daemon stop.
-- [ ] CLI and direct HTTP tests use isolated state, verify observable lifecycle behavior, and clean up launched processes.
+- [x] Daemon start, status, and stop work through the CLI and local HTTP interface, with clear output and exit behavior. Start bootstraps the process through the CLI; the running HTTP interface exposes health, status, and authenticated shutdown.
+- [x] The daemon listens only on loopback and initializes persistent SQLite storage with schema migration tracking.
+- [x] Repeated start succeeds for a healthy daemon without launching another instance. An unresponsive existing instance is reported rather than silently replaced.
+- [x] Stop shuts down the daemon cleanly and is safe to repeat. Agent terminals, when later supported, are not terminated by daemon stop.
+- [x] CLI and direct HTTP tests use isolated state, verify observable lifecycle behavior, and clean up launched processes.
+
+## Implementation verification
+
+Typechecking and all seven automated CLI/HTTP tests pass. Standards and spec reviews found a shutdown identity race and a failed-test cleanup gap; both were fixed and re-reviewed with no remaining findings. The daemon uses an automatically assigned loopback port, a private shutdown credential, and a persistent database identity exposed through health/status. Stopped or unresponsive status intentionally returns a nonzero CLI exit code. No agent launch or messaging behavior has been implemented.
 
 ## Manual validation
 
