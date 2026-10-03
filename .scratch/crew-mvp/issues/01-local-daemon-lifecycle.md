@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** awaiting-manual-validation
+**Status:** accepted-for-progression
 
 - [x] Daemon start, status, and stop work through the CLI and local HTTP interface, with clear output and exit behavior. Start bootstraps the process through the CLI; the running HTTP interface exposes health, status, and authenticated shutdown.
 - [x] The daemon listens only on loopback and initializes persistent SQLite storage with schema migration tracking.
@@ -24,4 +24,4 @@ Typechecking and all seven automated CLI/HTTP tests pass. Standards and spec rev
 
 ## Completion gate
 
-After automated checks pass, provide exact commands, prerequisites, and expected results for the manual checks above. Stop and wait for the user's explicit sign-off before implementing any other ticket. If validation fails, repair this ticket first. No manual acceptance has been recorded.
+After automated checks pass, provide exact commands, prerequisites, and expected results for the manual checks above. Stop and wait for the user's explicit sign-off before implementing any other ticket. If validation fails, repair this ticket first. On October 3, 2026, the user approved proceeding to ticket 2 and requested a PR for ticket 1. This releases the progression gate; individual manual-check results were not supplied and are not marked as performed.
