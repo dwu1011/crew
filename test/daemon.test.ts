@@ -81,7 +81,7 @@ test('a human can start, inspect, and stop a loopback daemon', async () => {
 test('restart preserves database identity and migrations while creating a new boot', async () => {
   const directory = await home();
   const first = JSON.parse((await cli(directory, 'start', '--json')).stdout);
-  expect(first.database.migrations).toEqual([{ name: '001_daemon_lifecycle' }]);
+  expect(first.database.migrations).toEqual([{ name: '001_daemon_lifecycle' }, { name: '002_single_seat' }]);
   await cli(directory, 'stop');
   expect(JSON.parse((await cli(directory, 'stop', '--json')).stdout).status).toBe('stopped');
   await expect(cli(directory, 'status', '--json')).rejects.toMatchObject({ code: 1, stdout: '{"status":"stopped"}\n' });
