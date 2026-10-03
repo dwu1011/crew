@@ -1,0 +1,125 @@
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve, join } from 'node:path';
+import { connect } from 'node:net';
+import { promisify } from 'node:util';
+import { afterEach, expect, test } from 'vitest';
+
+const exec = promisify(execFile);
+const homes: string[] = [];
+
+async function cli(home: string, ...args: string[]) {
+  return exec(process.execPath, [resolve('dist/cli.js'), '--state-dir', home, 'daemon', ...args], { timeout: 15000 });
+}
+
+async function home() {
+  const directory = await mkdtemp(join(tmpdir(), 'crew-test-'));
+  homes.push(directory);
+  return directory;
+}
+
+afterEach(async () => {
+  for (const directory of homes.splice(0)) {
+    await cli(directory, 'stop').catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a human can start, inspect, and stop a loopback daemon', async () => {
+  const directory = await home();
+  const started = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  expect(started.status).toBe('running');
+  expect(new URL(started.url).hostname).toBe('127.0.0.1');
+
+  const status = JSON.parse((await cli(directory, 'status', '--json')).stdout);
+  expect(status.pid).toBe(started.pid);
+  const response = await fetch(`${started.url}/health`);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ status: 'running', pid: started.pid });
+
+  expect(JSON.parse((await cli(directory, 'stop', '--json')).stdout).status).toBe('stopped');
+  await expect(fetch(`${started.url}/health`)).rejects.toThrow();
+}, 20000);
+
+test('restart preserves database identity and migrations while creating a new boot', async () => {
+  const directory = await home();
+  const first = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  expect(first.database.migrations).toEqual([{ name: '001_daemon_lifecycle' }]);
+  await cli(directory, 'stop');
+  expect(JSON.parse((await cli(directory, 'stop', '--json')).stdout).status).toBe('stopped');
+  await expect(cli(directory, 'status', '--json')).rejects.toMatchObject({ code: 1, stdout: '{"status":"stopped"}\n' });
+  const second = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  expect(second.database.instanceId).toBe(first.database.instanceId);
+  expect(second.database.bootCount).toBe(first.database.bootCount + 1);
+  expect(second.database.migrations).toEqual(first.database.migrations);
+  expect(second.bootId).not.toBe(first.bootId);
+}, 20000);
+
+test('a live unresponsive daemon is reported and never replaced', async () => {
+  const directory = await home();
+  const started = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  process.kill(started.pid, 'SIGSTOP');
+  try {
+    await expect(cli(directory, 'status', '--json')).rejects.toMatchObject({ code: 1 });
+    await expect(cli(directory, 'start')).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('unresponsive') });
+    await expect(cli(directory, 'stop')).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('unresponsive') });
+  } finally {
+    process.kill(started.pid, 'SIGCONT');
+  }
+  expect(JSON.parse((await cli(directory, 'status', '--json')).stdout).bootId).toBe(started.bootId);
+}, 20000);
+
+test('HTTP health and status agree, and HTTP shutdown requires the local credential', async () => {
+  const directory = await home();
+  const started = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  const health = await fetch(`${started.url}/health`);
+  const status = await fetch(`${started.url}/status`);
+  expect(await health.json()).toEqual(await status.json());
+  const rejected = await fetch(`${started.url}/shutdown`, { method: 'POST' });
+  expect(rejected.status).toBe(401);
+  expect(await rejected.json()).toEqual({ error: 'Unauthorized' });
+  expect((await fetch(`${started.url}/health`)).status).toBe(200);
+  const discovery = JSON.parse(await readFile(join(directory, 'daemon.json'), 'utf8'));
+  const accepted = await fetch(`${started.url}/shutdown`, {
+    method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` },
+  });
+  expect(accepted.status).toBe(200);
+  expect(await accepted.json()).toEqual({ status: 'stopping' });
+  await expect.poll(async () => {
+    try {
+      await fetch(`${started.url}/health`);
+      return false;
+    } catch {
+      return true;
+    }
+  }).toBe(true);
+}, 20000);
+
+test('shutdown completes even when an HTTP client leaves its request unfinished', async () => {
+  const directory = await home();
+  const started = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  const url = new URL(started.url);
+  const socket = connect(Number(url.port), url.hostname);
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+  socket.write('GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n');
+  try {
+    const stopped = JSON.parse((await cli(directory, 'stop', '--json')).stdout);
+    expect(stopped.status).toBe('stopped');
+  } finally {
+    socket.destroy();
+  }
+}, 20000);
+
+test('concurrent starts all reuse one healthy instance', async () => {
+  const directory = await home();
+  const results = await Promise.all(Array.from({ length: 6 }, () => cli(directory, 'start', '--json')));
+  const statuses = results.map((result) => JSON.parse(result.stdout));
+  expect(new Set(statuses.map((status) => status.pid)).size).toBe(1);
+  expect(new Set(statuses.map((status) => status.bootId)).size).toBe(1);
+  const repeated = JSON.parse((await cli(directory, 'start', '--json')).stdout);
+  expect(repeated.bootId).toBe(statuses[0].bootId);
+}, 20000);
