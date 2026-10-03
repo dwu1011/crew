@@ -3,7 +3,7 @@ import { mkdir, open, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { processAlive, readDiscovery } from './state.js';
+import { processAlive, readDiscovery, type Discovery } from './state.js';
 
 export interface DaemonStatus {
   status: 'running' | 'stopping' | 'stopped' | 'unresponsive';
@@ -15,7 +15,10 @@ export interface DaemonStatus {
 }
 
 export async function inspect(directory: string): Promise<DaemonStatus> {
-  const discovery = await readDiscovery(directory);
+  return inspectDiscovery(await readDiscovery(directory));
+}
+
+async function inspectDiscovery(discovery: Discovery | undefined): Promise<DaemonStatus> {
   if (!discovery || !processAlive(discovery.pid)) return { status: 'stopped' };
   try {
     const response = await fetch(`${discovery.url}/status`, { signal: AbortSignal.timeout(1000) });
@@ -54,10 +57,11 @@ export async function start(directory: string): Promise<DaemonStatus> {
 }
 
 export async function stop(directory: string): Promise<DaemonStatus> {
-  const current = await inspect(directory);
+  const discovery = await readDiscovery(directory);
+  if (!discovery) return { status: 'stopped' };
+  const current = await inspectDiscovery(discovery);
   if (current.status === 'stopped') return current;
   if (current.status === 'unresponsive') throw new Error('Daemon is unresponsive; refusing to signal an unverified process.');
-  const discovery = (await readDiscovery(directory))!;
   const response = await fetch(`${discovery.url}/shutdown`, {
     method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, signal: AbortSignal.timeout(2000),
   });

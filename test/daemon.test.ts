@@ -3,14 +3,31 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { connect } from 'node:net';
+import { createServer } from 'node:http';
+import { writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { afterEach, expect, test } from 'vitest';
 
 const exec = promisify(execFile);
 const homes: string[] = [];
+const ownedPids = new Map<string, Set<number>>();
 
 async function cli(home: string, ...args: string[]) {
-  return exec(process.execPath, [resolve('dist/cli.js'), '--state-dir', home, 'daemon', ...args], { timeout: 15000 });
+  try {
+    return await exec(process.execPath, [resolve('dist/cli.js'), '--state-dir', home, 'daemon', ...args], { timeout: 15000 });
+  } finally {
+    if (args[0] === 'start') {
+      const record = await readFile(join(home, 'daemon.json'), 'utf8').catch(() => undefined);
+      if (record) {
+        const { pid } = JSON.parse(record);
+        if (Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid) {
+          const pids = ownedPids.get(home) ?? new Set<number>();
+          pids.add(pid);
+          ownedPids.set(home, pids);
+        }
+      }
+    }
+  }
 }
 
 async function home() {
@@ -22,6 +39,25 @@ async function home() {
 afterEach(async () => {
   for (const directory of homes.splice(0)) {
     await cli(directory, 'stop').catch(() => {});
+    for (const pid of ownedPids.get(directory) ?? []) {
+      try {
+        process.kill(pid, 'SIGCONT');
+        process.kill(pid, 'SIGTERM');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') continue;
+        throw error;
+      }
+      await expect.poll(() => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+          throw error;
+        }
+      }, { timeout: 5000 }).toBe(false);
+    }
+    ownedPids.delete(directory);
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -122,4 +158,38 @@ test('concurrent starts all reuse one healthy instance', async () => {
   expect(new Set(statuses.map((status) => status.bootId)).size).toBe(1);
   const repeated = JSON.parse((await cli(directory, 'start', '--json')).stdout);
   expect(repeated.bootId).toBe(statuses[0].bootId);
+}, 20000);
+
+test('shutdown stays bound to the daemon identity verified before discovery changes', async () => {
+  const directory = await home();
+  let predecessorRequests = 0;
+  let successorRequests = 0;
+  const successor = createServer((_request, response) => {
+    successorRequests++;
+    response.writeHead(409).end();
+  });
+  await new Promise<void>((resolve) => successor.listen(0, '127.0.0.1', resolve));
+  const successorPort = (successor.address() as { port: number }).port;
+  const replacement = { pid: process.pid, bootId: 'successor', url: `http://127.0.0.1:${successorPort}`, token: 'successor-token' };
+  const predecessor = createServer(async (request, response) => {
+    if (request.url === '/status') {
+      await writeFile(join(directory, 'daemon.json'), JSON.stringify(replacement));
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ ...original, status: 'running' }));
+    } else {
+      predecessorRequests++;
+      response.writeHead(409).end();
+    }
+  });
+  await new Promise<void>((resolve) => predecessor.listen(0, '127.0.0.1', resolve));
+  const predecessorPort = (predecessor.address() as { port: number }).port;
+  const original = { pid: process.pid, bootId: 'predecessor', url: `http://127.0.0.1:${predecessorPort}`, token: 'predecessor-token' };
+  await writeFile(join(directory, 'daemon.json'), JSON.stringify(original));
+  try {
+    await expect(cli(directory, 'stop')).rejects.toMatchObject({ code: 1 });
+    expect(successorRequests).toBe(0);
+    expect(predecessorRequests).toBe(1);
+  } finally {
+    await Promise.all([predecessor, successor].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  }
 }, 20000);
