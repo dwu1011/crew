@@ -13,7 +13,7 @@ import { attachCrew, attachSession, detachCrew } from './terminal.js';
 const program = new Command().name('crew').description('Local agent crew coordinator')
   .option('--state-dir <directory>', 'Daemon state directory', process.env.CREW_HOME ?? join(homedir(), '.crew'));
 const daemon = program.command('daemon').description('Manage the local coordinator');
-program.command('send <seat>').description('Persist a message and queue terminal delivery')
+for (const mode of ['send', 'reply'] as const) program.command(mode === 'send' ? 'send <seat>' : 'reply <id>').description(mode === 'send' ? 'Persist a message and queue terminal delivery' : 'Reply and acknowledge the original as its recipient')
   .option('--crew <name>', 'Crew name').option('--text <body>', 'Literal message body')
   .option('--body-file <path>', 'Read body from a file; - reads standard input')
   .option('--request-id <id>', 'Reuse this identifier to recover a submission').option('--json', 'Machine-readable output')
@@ -27,8 +27,15 @@ program.command('send <seat>').description('Persist a message and queue terminal
     } else if (options.bodyFile !== undefined) body = await readFile(options.bodyFile, 'utf8');
     const requestId = options.requestId ?? randomUUID();
     console.error(`Submission request ID: ${requestId}. Reuse --request-id ${requestId} to recover this submission.`);
-    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), '/messages',
-      { crew: options.crew, recipient: seat, body, requestId }, process.env.CREW_EXECUTION_TOKEN);
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), mode === 'send' ? '/messages' : `/messages/${encodeURIComponent(seat)}/reply`,
+      { crew: options.crew, ...(mode === 'send' ? { recipient: seat } : {}), body, requestId }, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
+program.command('ack <id>').description('Acknowledge receipt as the current recipient execution')
+  .option('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
+  .action(async (id: string, options: { crew?: string; json?: boolean }) => {
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}/ack`,
+      { crew: options.crew }, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
 program.command('inbox').description('Inspect incoming messages without acknowledging them')
