@@ -4,6 +4,8 @@ import { promisify } from 'node:util';
 import { Command } from 'commander';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { inspect, start, stop } from './lifecycle.js';
 import { request } from './client.js';
 import { attachCrew, attachSession, detachCrew } from './terminal.js';
@@ -11,6 +13,38 @@ import { attachCrew, attachSession, detachCrew } from './terminal.js';
 const program = new Command().name('crew').description('Local agent crew coordinator')
   .option('--state-dir <directory>', 'Daemon state directory', process.env.CREW_HOME ?? join(homedir(), '.crew'));
 const daemon = program.command('daemon').description('Manage the local coordinator');
+program.command('send <seat>').description('Persist a message for a seat; terminal delivery is pending')
+  .option('--crew <name>', 'Crew name').option('--text <body>', 'Literal message body')
+  .option('--body-file <path>', 'Read body from a file; - reads standard input')
+  .option('--request-id <id>', 'Reuse this identifier to recover a submission').option('--json', 'Machine-readable output')
+  .action(async (seat: string, options: { crew?: string; text?: string; bodyFile?: string; requestId?: string; json?: boolean }) => {
+    if ((options.text !== undefined) === (options.bodyFile !== undefined)) throw new Error('Provide exactly one of --text or --body-file.');
+    let body = options.text;
+    if (options.bodyFile === '-') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+      body = Buffer.concat(chunks).toString('utf8');
+    } else if (options.bodyFile !== undefined) body = await readFile(options.bodyFile, 'utf8');
+    const requestId = options.requestId ?? randomUUID();
+    console.error(`Submission request ID: ${requestId}. Reuse --request-id ${requestId} to recover this submission.`);
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), '/messages',
+      { crew: options.crew, recipient: seat, body, requestId }, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
+program.command('inbox').description('Inspect incoming messages without acknowledging them')
+  .option('--crew <name>', 'Crew name').option('--all', 'Include acknowledged history').option('--json', 'Machine-readable output')
+  .action(async (options: { crew?: string; all?: boolean; json?: boolean }) => {
+    const query = new URLSearchParams({ ...(options.crew ? { crew: options.crew } : {}), ...(options.all ? { all: 'true' } : {}) });
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/inbox?${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
+program.command('message').description('Inspect persisted messages').command('show <id>')
+  .option('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
+  .action(async (id: string, options: { crew?: string; json?: boolean }) => {
+    const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
 program.command('up <configuration>').description('Launch configured Claude Code seats')
   .option('--json', 'Machine-readable output').action(async (configuration: string, options: { json?: boolean }) => {
     const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
