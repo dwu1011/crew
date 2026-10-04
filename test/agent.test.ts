@@ -45,28 +45,39 @@ if (${JSON.stringify(mode)} === 'discovery') {
   if (members.status !== 0) { console.error(members.stderr); process.exit(1); }
 }
 if (${JSON.stringify(mode)}.startsWith('delivery')) {
-  const render = (draft = '', footer = '-- INSERT -- ⏵⏵ auto mode on') => process.stdout.write('\\x1b[2J\\x1b[HClaude Code v2.1.289\\n────────────────────────────────────────\\n❯ ' + draft + '\\n────────────────────────────────────────\\n  Model: Opus 5.5 | Thinking: medium\\n  Context: [░░░░]\\n  ' + footer + '\\x1b[3;3H\\x1b[?2004h');
+  const render = (draft = '', footer = '-- INSERT -- ⏵⏵ auto mode on') => process.stdout.write('\\x1b[2J\\x1b[HClaude Code v2.1.289\\n────────────────────────────────────────\\n❯ ' + draft.replaceAll('\\n', '\\n  ') + '\\n────────────────────────────────────────\\n  Model: Opus 5.5 | Thinking: medium\\n  Context: [░░░░]\\n  ' + footer + '\\x1b[3;3H\\x1b[?2004h');
   process.stdin.setRawMode(true);
-  let draft = '', pasting = false, received = [];
+  let draft = '', pasting = false, paste = '', collapsed = false, received = [];
   render();
   process.stdin.on('data', chunk => {
     let text = chunk.toString();
-    if (text.includes('\\x1b[200~')) { pasting = true; text = text.replace('\\x1b[200~', ''); }
+    if (text.includes('\\x1b[200~')) { pasting = true; paste = ''; text = text.replace('\\x1b[200~', ''); }
     const endPaste = text.includes('\\x1b[201~');
     text = text.replace('\\x1b[201~', '');
-    if (text === '\\x15') { draft = ''; render(); return; }
+    if (text === '\\x15') { draft = ''; collapsed = false; render(); return; }
+    if (text === '\\x10') { process.stdout.write('\\x1b[2J\\x1b[HDo you want to proceed?\\n❯ 1. Allow once\\nEsc to cancel'); return; }
+    if (text === '\\x13') { process.stdout.write('\\x1b[2J\\x1b[HChoose option\\n❯ 1. Allow once\\nEsc to cancel'); return; }
+    if (text === '\\x02') { render('', 'esc to interrupt'); return; }
     if (text === '\\x12') { process.stdout.write('\\x1b[2J\\x1b[HUnrecognized native screen'); return; }
     if (!pasting && text.includes('\\r')) {
       received.push(draft + text.replaceAll('\\r', ''));
       writeFileSync(${JSON.stringify(join(directory, 'received.json'))}, JSON.stringify(received));
       draft = ''; render(); return;
     }
-    draft += text;
-    if (endPaste) pasting = false;
-    if (endPaste && ${JSON.stringify(mode)} === 'delivery-slow') {
-      process.stdout.write('\\x1b[2J\\x1b[HRendering paste...');
-      setTimeout(() => render('[Pasted text #1 +6 lines]', 'paste again to expand'), 650);
-      return;
+    if (pasting) paste += text; else draft += text;
+    if (endPaste) {
+      pasting = false;
+      if (${JSON.stringify(mode)} === 'delivery-slow' && collapsed) {
+        if (paste !== draft) draft += paste;
+        collapsed = false; render(draft); return;
+      }
+      draft += paste;
+      if (${JSON.stringify(mode)} === 'delivery-slow') {
+        collapsed = true;
+        process.stdout.write('\\x1b[2J\\x1b[HRendering paste...');
+        setTimeout(() => { if (collapsed) render('[Pasted text #1 +6 lines]', 'paste again to expand'); }, 650);
+        return;
+      }
     }
     render(draft);
   });
@@ -82,8 +93,8 @@ async function cli(state: string, ...args: string[]) {
   return exec(process.execPath, [cliPath, '--state-dir', state, ...args], { timeout: 15000 });
 }
 
-async function deliveryFault(phase: 'load' | 'paste' | 'target' | 'enter' | 'draft') {
-  const item = await fixture('delivery');
+async function deliveryFault(phase: 'load' | 'paste' | 'target' | 'enter' | 'draft' | 'collapsed') {
+  const item = await fixture(phase === 'collapsed' ? 'delivery-slow' : 'delivery');
   const tmux = (await exec('which', ['tmux'])).stdout.trim();
   const bin = join(item.directory, 'fault-bin');
   const marker = join(item.directory, 'input-attempt');
@@ -108,6 +119,15 @@ if (phase === 'paste' && args.includes('if-shell') && args.some(arg => arg.inclu
 }
 if (phase === 'enter' && args.includes('if-shell') && args.some(arg => arg.includes('send-keys'))) replace(args[args.indexOf('-S') + 1]);
 const result = run(args);
+if (phase === 'collapsed' && args.includes('if-shell') && args.some(arg => arg.includes('paste-buffer')) && !existsSync(${JSON.stringify(marker)})) {
+  writeFileSync(${JSON.stringify(marker)}, 'replaced');
+  const socket = args[args.indexOf('-S') + 1], pane = args[args.indexOf('-t') + 1];
+  run(['-S', socket, 'send-keys', '-t', pane, 'C-u']);
+  writeFileSync(${JSON.stringify(join(item.directory, 'foreign.txt'))}, 'HUMAN_REPLACEMENT\\nsecond line\\nthird line\\nfourth line');
+  run(['-S', socket, 'load-buffer', '-b', 'foreign', ${JSON.stringify(join(item.directory, 'foreign.txt'))}]);
+  run(['-S', socket, 'paste-buffer', '-t', pane, '-b', 'foreign', '-r', '-p']);
+}
+
 if (phase === 'draft' && args.includes('if-shell') && args.some(arg => arg.includes('paste-buffer')))
   run(['-S', args[args.indexOf('-S') + 1], 'send-keys', '-t', args[args.indexOf('-t') + 1], '-l', 'USER_EXTRA']);
 if (phase === 'target' && args.includes('load-buffer')) {
@@ -647,6 +667,8 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
   });
   await cli(state, 'up', config, '--json');
   await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const managed = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0].tmux;
+  await expect.poll(async () => (await exec('tmux', ['-S', managed.socket, 'capture-pane', '-p', '-J', '-t', managed.pane])).stdout).toContain('CREW_IDENTITY=');
   const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
   const headers = { Authorization: `Bearer ${discovery.token}` };
   const shutdown = fetch(`${discovery.url}/crews/down`, { method: 'POST', headers, body: JSON.stringify({ crew: 'sample' }) });
@@ -658,7 +680,8 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
     await exec('tmux', ['-S', during.seats[0].tmux.socket, 'has-session', '-t', during.seats[0].tmux.session]);
   } finally {
     await writeFile(release, 'release');
-    expect(await (await shutdown).json()).toMatchObject({ status: 'stopped' });
+    const response = await shutdown;
+    expect(await response.json(), response.ok ? undefined : await readFile(join(state, 'daemon.log'), 'utf8')).toMatchObject({ status: 'stopped' });
   }
 }, 25000);
 
@@ -822,16 +845,17 @@ test('submission retries recover the original message across restart and reject 
   await first.body!.cancel();
   const recovered = await (await submit()).json();
   expect(recovered).toMatchObject({ body: 'Recover this request.', deliveries: [{ status: 'pending' }] });
+  const stable = { ...recovered, deliveries: [expect.objectContaining({ id: recovered.deliveries[0].id, status: 'pending', executionId: null })] };
   const concurrent = await Promise.all([submit(), submit()]);
-  for (const response of concurrent) expect(await response.json()).toEqual(recovered);
+  for (const response of concurrent) expect(await response.json()).toEqual(stable);
   await cli(state, 'daemon', 'stop');
   await cli(state, 'daemon', 'start');
   discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
-  expect(await (await submit()).json()).toEqual(recovered);
+  expect(await (await submit()).json()).toEqual(stable);
   const conflict = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` },
     body: JSON.stringify({ recipient: 'investigator', body: 'Changed contents.', requestId: 'lost-response' }) });
   expect(conflict.status).toBe(409);
-  expect(JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages).toEqual([recovered]);
+  expect(JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages).toEqual([stable]);
   expect(JSON.parse((await cli(state, 'message', 'show', recovered.id, '--json')).stdout).acknowledgedAt).toBeNull();
 }, 20000);
 
@@ -925,7 +949,7 @@ test.each(['delivery', 'delivery-slow'] as const)('a full literal message is sub
   await cli(state, 'up', config);
   await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
   const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
-  const body = "Line one: café 雪\nLine two: 'quotes' \"double\" `echo literal` $(echo literal)\n";
+  const body = "Line one: café 雪\nLine two: 'quotes' \"double\" `echo literal` $(echo literal)\nDo you want to proceed? esc to interrupt\n";
   const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', body, '--json')).stdout);
   expect(sent.deliveries[0].status).toBe('pending');
   await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0],
@@ -944,9 +968,9 @@ test.each(['delivery', 'delivery-slow'] as const)('a full literal message is sub
 
 test.each([
   ['existing draft', 'My existing draft', 'draft'],
-  ['permission dialog', 'Do you want to proceed?', 'Permission'],
-  ['selection menu', '1. Allow once', 'selection'],
-  ['busy turn', 'esc to interrupt', 'busy'],
+  ['permission dialog', '\u0010', 'Unrecognized'],
+  ['selection menu', '\u0013', 'Unrecognized'],
+  ['busy turn', '\u0002', 'busy'],
   ['unknown screen', '\u0012', 'Unrecognized'],
 ])('delivery defers for %s and resumes after a verified empty prompt', async (_name, input, reason) => {
   const { directory, state, config, binary } = await fixture('delivery');
@@ -961,7 +985,7 @@ test.each([
   await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0], { timeout: 8000 })
     .toMatchObject({ status: 'pending', failure: expect.stringContaining(reason) });
   await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
-  if (input !== '\u0012') expect((await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout).toContain(input);
+  if (input === 'My existing draft') expect((await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout).toContain(input);
   await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
   await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status, { timeout: 8000 }).toBe('submitted');
   const received = JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'));
@@ -1035,7 +1059,7 @@ test('a terminal replaced after preparation receives no stale message input', as
   expect((await exec('tmux', ['-S', socket, 'list-panes', '-a', '-F', '#{pane_current_command}'])).stdout.trim()).toBe('sleep');
 }, 20000);
 
-test.each(['enter', 'draft'] as const)('delivery refuses Enter after a post-paste %s change', async (phase) => {
+test.each(['enter', 'draft', 'collapsed'] as const)('delivery refuses Enter after a post-paste %s change', async (phase) => {
   const { directory, state, config } = await deliveryFault(phase);
   await cli(state, 'up', config);
   const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Verify again before Enter.', '--json')).stdout);
@@ -1044,7 +1068,7 @@ test.each(['enter', 'draft'] as const)('delivery refuses Enter after a post-past
   await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   const capture = (await exec('tmux', ['-S', join(state, 'tmux.sock'), 'capture-pane', '-p', '-J', '-t', '%0'])).stdout;
   if (phase === 'enter') expect(capture).not.toContain(sent.id);
-  else expect(capture).toContain('USER_EXTRA');
+  else expect(capture).toContain(phase === 'collapsed' ? 'HUMAN_REPLACEMENT' : 'USER_EXTRA');
 }, 20000);
 
 test('unsupported terminal versions remain pending and unsafe control bytes are never injected', async () => {

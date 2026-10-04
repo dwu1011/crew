@@ -86,18 +86,26 @@ export class Delivery {
         ['pane_pid', target.runnerPid], ['session_name', target.session], ['cursor_x', frame.x], ['cursor_y', frame.y], ['pane_in_mode', 0], ['pane_input_off', 0],
       ].map(([key, value]) => `#{==:#{${key}},${value}}`).reduce((previous, check) => `#{&&:${previous},${check}}`);
       const pasted = await tmux(['if-shell', '-F', '-t', target.pane, condition(ready),
-        `paste-buffer -t ${target.pane} -b ${buffer} -d -r -p ; display-message -p crew-pasted`, 'display-message -p crew-refused']);
+        `paste-buffer -t ${target.pane} -b ${buffer} -r -p ; display-message -p crew-pasted`, 'display-message -p crew-refused']);
       if (pasted.stdout.trim() !== 'crew-pasted') { if (pasted.stdout.trim() === 'crew-refused') inputAttempted = false; throw new Error('Terminal target or cursor changed before paste'); }
       const expectedPrompt = envelope.split('\n').map((line) => line.trimEnd()).join('\n');
-      const deadline = Date.now() + 1800;
+      let deadline = Date.now() + 1800;
+      let expanded = false;
       let draft: Awaited<ReturnType<typeof observeClaudeInput>>;
       for (;;) {
         const after = await this.crews.deliveryTarget(attempt.recipient_seat_id);
         draft = await observeClaudeInput(this.crews.socket, target.pane, target.version);
         if (this.stopping || !after.target || after.target.executionId !== target.executionId || !this.crews.currentTarget(target) || draft.state === 'blocked')
           throw new Error('Recipient target or input safety changed after paste');
-        const ownPaste = draft.prompt.replace(/^❯[ \u00a0]/, '') === expectedPrompt
-          || /^❯[ \u00a0]*\[Pasted text #\d+ \+\d+ lines\]\s*$/.test(draft.prompt);
+        const ownPaste = draft.prompt.replace(/^❯[ \u00a0]/, '') === expectedPrompt;
+        if (draft.state === 'draft' && !expanded && /^❯[ \u00a0]*\[Pasted text #\d+ \+\d+ lines\]\s*$/.test(draft.prompt)) {
+          const expansion = await tmux(['if-shell', '-F', '-t', target.pane, condition(draft),
+            `paste-buffer -t ${target.pane} -b ${buffer} -r -p ; display-message -p crew-expanded`, 'display-message -p crew-refused']);
+          if (expansion.stdout.trim() !== 'crew-expanded') throw new Error('Terminal target or cursor changed before paste expansion');
+          expanded = true;
+          deadline = Date.now() + 1800;
+          continue;
+        }
         if (draft.state === 'draft' && ownPaste) break;
         if (Date.now() >= deadline) throw new Error(`Pasted input could not be verified before Enter: ${draft.reason ?? draft.state}`);
         await new Promise((resolve) => setTimeout(resolve, 60));
