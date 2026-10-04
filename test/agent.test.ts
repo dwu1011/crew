@@ -138,6 +138,7 @@ if (phase === 'draft' && args.includes('if-shell') && args.some(arg => arg.inclu
 if (phase === 'target' && args.includes('load-buffer')) {
   const socket = args[args.indexOf('-S') + 1];
   replace(socket);
+  writeFileSync(${JSON.stringify(marker)}, 'replaced');
 }
 process.exit(result.status ?? 1);
 `, { mode: 0o700 });
@@ -1054,9 +1055,10 @@ test('submitting precedes paste and an ambiguous paste failure stays uncertain',
 }, 20000);
 
 test('a terminal replaced after preparation receives no stale message input', async () => {
-  const { state, config } = await deliveryFault('target');
+  const { state, config, marker } = await deliveryFault('target');
   await cli(state, 'up', config);
   const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Never write to a replacement terminal.', '--json')).stdout);
+  await expect.poll(() => readFile(marker, 'utf8').catch(() => ''), { timeout: 8000 }).toBe('replaced');
   await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0],
     { timeout: 8000 }).toMatchObject({ status: 'pending', executionId: null, failure: expect.any(String) });
   const socket = join(state, 'tmux.sock');
