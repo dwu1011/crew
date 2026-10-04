@@ -65,7 +65,6 @@ export class Messages {
         }).immediate();
       } finally { db.pragma('foreign_keys = ON'); }
     }
-
   }
 
   private crew(caller: MessageCaller) {

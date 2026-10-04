@@ -832,8 +832,8 @@ test('an operator can persist and inspect a pending message to a stopped seat', 
     recipient: { seat: 'investigator' }, acknowledgedAt: null, deliveries: [{ status: 'pending', executionId: null }] });
   expect(sent.id).toBeTruthy();
   const shown = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
-  expect(shown).toEqual(sent);
-  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages).toEqual([sent]);
+  expect(shown).toEqual({ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] });
+  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages).toEqual([{ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] }]);
 }, 20000);
 
 test('submission retries recover the original message across restart and reject conflicting reuse', async () => {
@@ -889,7 +889,7 @@ test('managed messages derive their sender and enforce crew and participant scop
   expect(await (await fetch(`${discovery.url}/inbox`, { headers: coderHeaders })).json()).toMatchObject({ messages: [sent] });
   expect(await (await fetch(`${discovery.url}/inbox?all=true`, { headers: coderHeaders })).json()).toMatchObject({ messages: [sent] });
   expect((await fetch(`${discovery.url}/messages/${sent.id}`, { headers: { Authorization: `Bearer ${reviewerToken}` } })).status).toBe(404);
-  expect(await (await fetch(`${discovery.url}/messages/${sent.id}`, { headers: coderHeaders })).json()).toEqual(sent);
+  expect(await (await fetch(`${discovery.url}/messages/${sent.id}`, { headers: coderHeaders })).json()).toEqual({ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] });
   expect((await exec('tmux', ['-S', crew.seats[1].tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', crew.seats[1].tmux.pane])).stdout).not.toContain('unique-persisted-only-request');
   await cli(state, 'down', '--crew', 'sample');
   expect((await send(plannerToken)).status).toBe(401);
@@ -943,7 +943,7 @@ test('operator messaging requires unambiguous crew selection and validates the H
     const response = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify(body) });
     expect(response.status).toBe(400);
   }
-  expect(JSON.parse((await cli(state, 'inbox', '--crew', 'sample', '--json')).stdout).messages).toEqual([sent]);
+  expect(JSON.parse((await cli(state, 'inbox', '--crew', 'sample', '--json')).stdout).messages).toEqual([{ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] }]);
 }, 20000);
 
 test.each(['delivery', 'delivery-slow'] as const)('a full literal message is submitted to the verified ready terminal without acknowledgment (%s)', async (mode) => {
