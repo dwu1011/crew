@@ -4,7 +4,7 @@
 
 **Blocked by:** 05: Persist and inspect messages (including manual acceptance).
 
-**Status:** awaiting-manual-validation
+**Status:** completed
 
 - [x] A delivery worker resolves the current recipient execution and waits for a supported ready-input condition without blocking the send request indefinitely.
 - [x] Permission dialogs, selection menus, existing drafts, and unknown readiness defer injection with inspectable reasons.
@@ -17,13 +17,13 @@
 
 ## Manual validation
 
-- [ ] Send to a ready agent and observe the entire envelope in its native terminal; inspect submitted status without acknowledgment.
-- [ ] Create an existing input draft and verify the message remains pending rather than overwriting it; clear the draft and verify delivery becomes possible.
-- [ ] Send two messages close together and confirm distinct, noninterleaved envelopes with preserved bodies.
+- [x] Send to a ready agent and observe the entire envelope in its native terminal; inspect submitted status without acknowledgment.
+- [x] Create an existing input draft and verify the message remains pending rather than overwriting it; clear the draft and verify delivery becomes possible.
+- [x] Send two messages close together and confirm distinct, noninterleaved envelopes with preserved bodies.
 
 ## Completion gate
 
-Present a runnable native-terminal demonstration and expected results after automated checks pass. Stop and await explicit manual acceptance. No manual acceptance has been recorded.
+Present a runnable native-terminal demonstration and expected results after automated checks pass. Stop and await explicit manual acceptance. The user delegated validation and sequential progression on 2026-10-04. All native checks passed; evidence: `/private/tmp/crew-validate-6-final-QWPcyY/report.json`.
 
 
 ## Verification
@@ -104,4 +104,4 @@ bun run crew down --crew demo --json
 bun run crew daemon stop
 ```
 
-Implementation is ready for manual validation. Stop here; ticket 7 must await explicit acceptance.
+Native validation passed. The user authorized assisted validation and progression to subsequent slices.
