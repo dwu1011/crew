@@ -1,0 +1,6 @@
+name: demo
+project: ../..
+agents:
+  investigator:
+    runtime: claude
+    role_file: role.md
