@@ -16,7 +16,7 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const missingTerminal = /no server running|can't find|no such|\(No such file or directory\)|\(Connection refused\)/;
 const processHasExited = (pid: number, identity: string | null) => {
   const current = processIdentity(pid);
-  return current === null ? !processAlive(pid) : current !== identity;
+  return current === null || identity === null ? !processAlive(pid) : current !== identity;
 };
 
 interface Execution {

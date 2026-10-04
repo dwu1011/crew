@@ -595,15 +595,15 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
   }
 }, 25000);
 
-test('failed process inspection cannot mark a surviving native process stopped', async () => {
+test.each(['shutdown', 'startup'])('failed process inspection cannot mark a surviving native process stopped (%s)', async (failurePhase) => {
   const { directory, state, config, binary } = await fixture();
   const pidFile = join(directory, 'native-pid');
   const marker = join(directory, 'terminal-stopping');
-  await writeFile(binary, (await readFile(binary, 'utf8')).replaceAll('process.stdin.resume();', `
+  await writeFile(binary, (await readFile(binary, 'utf8')).replace('const args = process.argv.slice(2);', `
 process.on('SIGHUP', () => {});
 setInterval(() => {}, 1000);
 writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
-process.stdin.resume();`));
+const args = process.argv.slice(2);`));
   const tmux = (await exec('which', ['tmux'])).stdout.trim();
   const ps = (await exec('which', ['ps'])).stdout.trim();
   const bin = join(directory, 'bin');
@@ -619,7 +619,8 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
 const { spawnSync } = await import('node:child_process');
 const { existsSync, readFileSync } = await import('node:fs');
 const args = process.argv.slice(2);
-if (existsSync(${JSON.stringify(marker)}) && args[args.indexOf('-p') + 1] === readFileSync(${JSON.stringify(pidFile)}, 'utf8')) process.exit(1);
+const fail = ${JSON.stringify(failurePhase)} === 'shutdown' ? existsSync(${JSON.stringify(marker)}) : !existsSync(${JSON.stringify(marker)});
+if (fail && existsSync(${JSON.stringify(pidFile)}) && args[args.indexOf('-p') + 1] === readFileSync(${JSON.stringify(pidFile)}, 'utf8')) process.exit(1);
 process.exit(spawnSync(${JSON.stringify(ps)}, args, { stdio: 'inherit' }).status ?? 1);
 `, { mode: 0o700 });
   let pid: number | undefined;
@@ -627,8 +628,10 @@ process.exit(spawnSync(${JSON.stringify(ps)}, args, { stdio: 'inherit' }).status
     await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
       env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
     });
-    await cli(state, 'up', config, '--json');
-    await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+    const launched = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
+    await expect.poll(async () => (await exec('tmux', ['-S', launched.seats[0].tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', launched.seats[0].tmux.pane])).stdout).toContain('CREW_IDENTITY=');
+    if (failurePhase === 'shutdown') await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+    else await expect(cli(state, 'status', '--json')).rejects.toMatchObject({ stdout: expect.stringContaining('"status":"unknown"') });
     await expect.poll(() => readFile(pidFile, 'utf8').catch(() => '')).not.toBe('');
     pid = Number(await readFile(pidFile, 'utf8'));
     await expect(cli(state, 'down', '--crew', 'sample')).rejects.toMatchObject({ code: 1 });
