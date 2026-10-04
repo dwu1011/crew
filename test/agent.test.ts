@@ -244,12 +244,12 @@ test.skipIf(process.env.CREW_NATIVE_SMOKE !== '1')('native Claude Code startup s
 }, 45000);
 
 
-async function multiFixture(mode: 'normal' | 'discovery' = 'normal') {
+async function multiFixture(mode: 'normal' | 'discovery' = 'normal', seats = ['planner', 'coder', 'reviewer']) {
   const setup = await fixture(mode);
-  for (const seat of ['planner', 'coder', 'reviewer']) {
+  for (const seat of seats) {
     await writeFile(join(setup.directory, `${seat}.md`), `You are the ${seat}. Perform only your assigned role.\n`);
   }
-  await writeFile(setup.config, `name: sample\nproject: project with spaces\nagents:\n${['planner', 'coder', 'reviewer'].map((seat) => `  ${seat}:\n    runtime: claude\n    role_file: ${seat}.md\n`).join('')}`);
+  await writeFile(setup.config, `name: sample\nproject: project with spaces\nagents:\n${seats.map((seat) => `  ${seat}:\n    runtime: claude\n    role_file: ${seat}.md\n`).join('')}`);
   return setup;
 }
 
@@ -436,3 +436,50 @@ test('terminal commands report unknown seats, require interactive attachment, an
     env: { ...process.env, CREW_EXECUTION_TOKEN: credential }, timeout: 15000,
   })).rejects.toMatchObject({ stderr: expect.stringContaining('only inspect their own crew') });
 }, 20000);
+
+
+test.each([
+  { count: 3, seats: ['planner', 'coder', 'reviewer'] },
+  { count: 6, seats: ['planner', 'coder', 'reviewer', 'auditor', 'designer', 'tester'] },
+])('a tiled crew view shows all seats and closes without replacing or stopping agents ($count seats)', async ({ seats }) => {
+  const { directory, state, config, binary } = await multiFixture('normal', seats);
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const views = join(state, 'views.sock');
+  const outer = join(directory, 'outer.sock');
+  try {
+    await exec('tmux', ['-f', '/dev/null', '-S', outer, 'new-session', '-d', '-s', 'viewer', '-x', '160', '-y', '40',
+      'sleep', '60']);
+    await exec('tmux', ['-S', outer, 'set-window-option', '-t', 'viewer:0', 'remain-on-exit', 'on']);
+    await exec('tmux', ['-S', outer, 'respawn-pane', '-k', '-t', 'viewer:0', process.execPath, cliPath, '--state-dir', state, 'attach', '--crew', 'sample']);
+    await expect.poll(async () => {
+      try { return (await exec('tmux', ['-S', views, 'list-panes', '-a', '-F', '#{@crew_seat}'])).stdout.trim().split('\n'); }
+      catch { return []; }
+    }, { timeout: 3000 }).toEqual(seats);
+    await expect.poll(async () => (await exec('tmux', ['-S', before.seats[0].tmux.socket, 'list-clients', '-F', '#{client_session}'])).stdout.trim().split('\n').sort())
+      .toEqual(before.seats.map((seat: { tmux: { session: string } }) => seat.tmux.session).sort());
+    await expect.poll(async () => (await exec('tmux', ['-S', views, 'list-clients'])).stdout.trim()).not.toBe('');
+    await exec('tmux', ['-S', outer, 'send-keys', '-t', 'viewer:0', 'C-a', 'd']);
+    await expect.poll(async () => (await exec('tmux', ['-S', before.seats[0].tmux.socket, 'list-clients'])).stdout.trim()).toBe('');
+    await exec('tmux', ['-S', outer, 'respawn-pane', '-k', '-t', 'viewer:0', process.execPath, cliPath, '--state-dir', state, 'attach', '--crew', 'sample']);
+    await expect.poll(async () => {
+      try { return (await exec('tmux', ['-S', views, 'list-panes', '-a', '-F', '#{@crew_seat}'])).stdout.trim().split('\n'); }
+      catch { return []; }
+    }, { timeout: 5000 }).toEqual(seats);
+    await cli(state, 'detach', '--crew', 'sample');
+    await expect.poll(async () => (await exec('tmux', ['-S', before.seats[0].tmux.socket, 'list-clients'])).stdout.trim()).toBe('');
+    const after = JSON.parse((await cli(state, 'status', '--json')).stdout);
+    expect(after.seats.map((seat: { executionId: string; status: string }) => ({ id: seat.executionId, status: seat.status })))
+      .toEqual(before.seats.map((seat: { executionId: string }) => ({ id: seat.executionId, status: 'ready' })));
+  } catch (error) {
+    console.error((await exec('tmux', ['-S', outer, 'capture-pane', '-p', '-J', '-S', '-'])).stdout);
+    throw error;
+  } finally {
+    await exec('tmux', ['-S', outer, 'kill-server'], { timeout: 5000 }).catch(() => {});
+    await exec('tmux', ['-S', views, 'kill-server'], { timeout: 5000 }).catch(() => {});
+  }
+}, 25000);

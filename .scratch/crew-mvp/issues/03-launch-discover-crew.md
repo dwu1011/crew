@@ -14,7 +14,7 @@
 - [x] Unsupported runtimes and duplicate seat names are rejected during validation.
 - [x] CLI and direct HTTP tests cover crew scope, membership, multi-seat launch, and partial failures.
 
-- [x] User-requested terminal shortcuts: `crew attach <seat> [--crew <name>]` and `crew detach <seat> [--crew <name>]` resolve named seats without requiring tmux socket/session copying. Detach disconnects clients while preserving agents.
+- [x] User-requested terminal shortcuts: `crew attach [seat] [--crew <name>]` and `crew detach [seat] [--crew <name>]` resolve named seats without requiring tmux socket/session copying. Detach disconnects clients while preserving agents.
 
 ## Manual validation
 
@@ -29,7 +29,7 @@ Supply runnable manual steps and expected outcomes after automated checks pass. 
 
 ## Manual handoff
 
-Automated verification: `bun run typecheck` passes; `bun run test` passes 28 tests with one opt-in native smoke check skipped. Standards and spec reviews against `83d8897` have no outstanding findings. Deterministic launch checks use a native-runtime substitute in real tmux; actual native multi-seat validation remains manual.
+Automated verification: `bun run typecheck` passes; `bun run test` passes 30 tests with one opt-in native smoke check skipped. Standards and spec reviews against `83d8897` have no outstanding findings. Deterministic launch checks use a native-runtime substitute in real tmux; actual native multi-seat validation remains manual.
 
 Use a fresh state directory so an older daemon does not run the previous binary. From the crew repository:
 
@@ -42,6 +42,14 @@ node dist/cli.js status --crew demo-crew --json
 ```
 
 Expected: planner, coder, and reviewer, each with distinct seat, execution, generation, native-session, and tmux-session identities. Members includes role text and execution status. `ready` means the native startup hook confirmed that execution, not that it is idle. Login/trust prompts may keep a seat launching until completed.
+
+Open the entire crew in a tiled view:
+
+```sh
+bun run crew attach --crew demo-crew
+```
+
+Each pane shows an existing Claude seat, labeled by role. Click a pane to select it, or use Ctrl-a followed by an arrow. Ctrl-a followed by d closes the view; the agents keep running. This prefix avoids Herdr's Ctrl-b shortcut. Alternatively, from another shell with the same `CREW_HOME`, run `bun run crew detach --crew demo-crew` to close this crew's overview views. These views use a separate private tmux server; native seat sessions are neither moved nor relaunched. Reattaching opens a fresh view of the existing seats. Failed seats without an active terminal are skipped with a diagnostic.
 
 Enter seats by name from the crew repository:
 

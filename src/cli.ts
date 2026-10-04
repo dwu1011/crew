@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Command } from 'commander';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { inspect, start, stop } from './lifecycle.js';
 import { request } from './client.js';
+import { attachCrew, attachSession, detachCrew } from './terminal.js';
 
 const program = new Command().name('crew').description('Local agent crew coordinator')
   .option('--state-dir <directory>', 'Daemon state directory', process.env.CREW_HOME ?? join(homedir(), '.crew'));
@@ -33,11 +34,16 @@ for (const [name, path, description] of [
     });
 }
 for (const name of ['attach', 'detach']) {
-  program.command(`${name} <seat>`).description(`${name === 'attach' ? 'Enter' : 'Disconnect clients from'} a seat's terminal`)
+  program.command(`${name} [seat]`).description(`${name === 'attach' ? 'Enter' : 'Disconnect from'} a seat or the entire crew`)
     .option('--crew <name>', 'Crew name; required when multiple crews exist')
-    .action(async (seatName: string, options: { crew?: string }) => {
+    .action(async (seatName: string | undefined, options: { crew?: string }) => {
       const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
-      const crew = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/crews${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
+      const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
+      const crew = await request(directory, `/crews${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
+      if (!seatName) {
+        await (name === 'attach' ? attachCrew : detachCrew)(directory, crew);
+        return;
+      }
       const seat = crew.seats.find((seat: { name: string }) => seat.name === seatName);
       if (!seat) throw new Error(`Unknown seat ${seatName} in crew ${crew.name}. Available seats: ${crew.seats.map((seat: { name: string }) => seat.name).join(', ')}`);
       if (!seat.tmux?.session || seat.status === 'failed') throw new Error(`Seat ${seatName} has no active terminal (${seat.status}).`);
@@ -52,16 +58,8 @@ for (const name of ['attach', 'detach']) {
         console.log(`Detached ${seatName} in crew ${crew.name}. The agent keeps running.`);
         return;
       }
-      if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('crew attach requires an interactive terminal.');
-      const env = { ...process.env };
-      delete env.TMUX;
-      delete env.TMUX_PANE;
       console.log(`To detach from another shell, run: crew detach ${seatName} --crew ${crew.name}`);
-      const child = spawn('tmux', ['-S', seat.tmux.socket, 'attach-session', '-t', `=${seat.tmux.session}`], { stdio: 'inherit', env });
-      await new Promise<void>((resolve, reject) => {
-        child.once('error', reject);
-        child.once('exit', (code) => { process.exitCode = code ?? 1; resolve(); });
-      });
+      await attachSession(seat.tmux.socket, seat.tmux.session);
     });
 }
 program.command('whoami').description('Verify the calling managed execution')
