@@ -52,7 +52,7 @@ for (const name of ['attach', 'detach']) {
       }
       const seat = crew.seats.find((seat: { name: string }) => seat.name === seatName);
       if (!seat) throw new Error(`Unknown seat ${seatName} in crew ${crew.name}. Available seats: ${crew.seats.map((seat: { name: string }) => seat.name).join(', ')}`);
-      if (!seat.tmux?.session || seat.status === 'failed') throw new Error(`Seat ${seatName} has no active terminal (${seat.status}).`);
+      if (!seat.tmux?.session || !['launching', 'ready'].includes(seat.status)) throw new Error(`Seat ${seatName} has no active terminal (${seat.status}).`);
       if (name === 'detach') {
         try {
           await promisify(execFile)('tmux', ['-S', seat.tmux.socket, 'detach-client', '-s', `=${seat.tmux.session}`], { timeout: 5000 });

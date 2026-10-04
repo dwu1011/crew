@@ -13,6 +13,11 @@ import { loadConfig } from './config.js';
 const exec = promisify(execFile);
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+const missingTerminal = /no server running|can't find|no such|\(No such file or directory\)|\(Connection refused\)/;
+const processHasExited = (pid: number, identity: string | null) => {
+  const current = processIdentity(pid);
+  return current === null ? !processAlive(pid) : current !== identity;
+};
 
 interface Execution {
   id: string;
@@ -187,7 +192,7 @@ export class Crews {
             try {
               await exec('tmux', ['-S', this.socket, 'kill-session', '-t', session], { timeout: 2000 });
             } catch (cleanupError) {
-              if (!/no server running|can't find|no such|\(No such file or directory\)|\(Connection refused\)/.test((cleanupError as { stderr?: string }).stderr ?? ''))
+              if (!missingTerminal.test((cleanupError as { stderr?: string }).stderr ?? ''))
                 failure += `; Terminal cleanup failed: ${(cleanupError as Error).message}`;
             }
           }
@@ -223,7 +228,7 @@ export class Crews {
       pane = (await exec('tmux', ['-S', this.socket, 'display-message', '-p', '-t', execution.tmux_pane ?? `=crew-${execution.id}:0.0`,
         '#{session_name}\t#{pane_id}\t#{pane_pid}'], { timeout: 2000 })).stdout.trim().split('\t');
     } catch (error) {
-      const missing = /no server running|can't find|no such|\(No such file or directory\)|\(Connection refused\)/.test((error as { stderr?: string }).stderr ?? '');
+      const missing = missingTerminal.test((error as { stderr?: string }).stderr ?? '');
       const alive = receipt && (processAlive(receipt.runnerPid) || (receipt.nativePid !== null && processAlive(receipt.nativePid)));
       return { ownership: missing && !alive ? 'absent' : 'unknown', ready: false, receipt, reason: missing ? 'Managed terminal or process is missing' : 'Managed terminal cannot be verified' };
     }
@@ -259,7 +264,7 @@ export class Crews {
       if (startupGrace && execution.status === 'launching' && Date.now() - Date.parse(execution.created_at) < 10000
         && (!observed.receipt || (observed.ownership === 'owned' && observed.reason === 'Native process is missing or mismatched'))) continue;
       if (execution.status === 'failed') {
-        if (!execution.retryable) this.db.prepare("UPDATE executions SET state = 'unknown' WHERE id = ? AND state <> 'stopped'").run(execution.id);
+        if (!execution.retryable) this.db.prepare("UPDATE executions SET state = 'unknown' WHERE id = ? AND state IN ('active', 'unknown')").run(execution.id);
         continue;
       }
       if (observed.ownership !== 'owned' || observed.reason) {
@@ -287,12 +292,12 @@ export class Crews {
         const deadline = Date.now() + 3000;
         while (Date.now() < deadline) {
           const receipt = observed.receipt!;
-          if (processIdentity(receipt.runnerPid) !== receipt.runnerIdentity
-            && (!receipt.nativePid || processIdentity(receipt.nativePid) !== receipt.nativeIdentity)) break;
+          if (processHasExited(receipt.runnerPid, receipt.runnerIdentity)
+            && (!receipt.nativePid || processHasExited(receipt.nativePid, receipt.nativeIdentity))) break;
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
-        if (processIdentity(observed.receipt!.runnerPid) === observed.receipt!.runnerIdentity
-          || (observed.receipt!.nativePid && processIdentity(observed.receipt!.nativePid) === observed.receipt!.nativeIdentity))
+        if (!processHasExited(observed.receipt!.runnerPid, observed.receipt!.runnerIdentity)
+          || (observed.receipt!.nativePid && !processHasExited(observed.receipt!.nativePid, observed.receipt!.nativeIdentity)))
           throw new Error('Managed processes have not exited after terminal shutdown');
       }
       this.db.prepare("UPDATE executions SET state = 'stopped' WHERE id = ? AND state = 'stopping'").run(execution.id);

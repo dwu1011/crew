@@ -14,7 +14,18 @@ if (process.argv[2] === '--hook') {
   for await (const chunk of process.stdin) input += chunk;
   const event = JSON.parse(input);
   const root = process.env.CREW_EXECUTION_ROOT!;
-  const receipt = JSON.parse(await readFile(join(root, 'process.json'), 'utf8'));
+  let contents: string;
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    try {
+      contents = await readFile(join(root, 'process.json'), 'utf8');
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  const receipt = JSON.parse(contents);
   if (receipt.nativeSessionId !== event.session_id || receipt.cwd !== event.cwd) throw new Error('Native startup identity mismatch');
   writeFileSync(join(root, 'ready.json'), JSON.stringify({ generation: receipt.generation, sessionId: event.session_id, cwd: event.cwd }), { mode: 0o600 });
   await report('/executions/ready', { sessionId: event.session_id, cwd: event.cwd });

@@ -108,6 +108,27 @@ test('a configured seat starts in tmux with role, project guidance, and authenti
   expect(await readFile(join(project, 'CLAUDE.md'), 'utf8')).toBe('Project convention: report findings before editing.\n');
 }, 25000);
 
+test('native startup waits for the runner identity receipt before reporting ready', async () => {
+  const { directory, state, config, binary } = await fixture();
+  const ps = (await exec('which', ['ps'])).stdout.trim();
+  const bin = join(directory, 'bin');
+  await mkdir(bin);
+  await writeFile(join(bin, 'ps'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const args = process.argv.slice(2);
+if (Number(args[args.indexOf('-p') + 1]) === process.ppid) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+process.exit(spawnSync(${JSON.stringify(ps)}, args, { stdio: 'inherit' }).status ?? 1);
+`, { mode: 0o700 });
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => {
+    const result = await cli(state, 'status', '--json').catch((error: { stdout: string }) => error);
+    return JSON.parse(result.stdout).status;
+  }, { timeout: 5000 }).toBe('ready');
+}, 20000);
+
 test('a native process remains launching until its startup identity is confirmed', async () => {
   const { state, config, binary } = await fixture('hold');
   await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
@@ -521,6 +542,7 @@ test('crew shutdown retains history, preserves other crews, and relaunch revokes
   const stopped = JSON.parse((await cli(state, 'down', '--crew', 'sample', '--json')).stdout);
   expect(stopped.status).toBe('stopped');
   expect(stopped.seats[0].history).toMatchObject([{ executionId: before.seats[0].executionId, status: 'stopped' }]);
+  await expect(cli(state, 'attach', 'investigator', '--crew', 'sample')).rejects.toMatchObject({ stderr: expect.stringContaining('no active terminal (stopped)') });
   expect(JSON.parse((await cli(state, 'status', '--crew', 'other', '--json')).stdout).status).toBe('ready');
   const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
   expect((await fetch(`${discovery.url}/whoami`, { headers: { Authorization: `Bearer ${credential}` } })).status).toBe(401);
@@ -573,6 +595,52 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
   }
 }, 25000);
 
+test('failed process inspection cannot mark a surviving native process stopped', async () => {
+  const { directory, state, config, binary } = await fixture();
+  const pidFile = join(directory, 'native-pid');
+  const marker = join(directory, 'terminal-stopping');
+  await writeFile(binary, (await readFile(binary, 'utf8')).replaceAll('process.stdin.resume();', `
+process.on('SIGHUP', () => {});
+setInterval(() => {}, 1000);
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.stdin.resume();`));
+  const tmux = (await exec('which', ['tmux'])).stdout.trim();
+  const ps = (await exec('which', ['ps'])).stdout.trim();
+  const bin = join(directory, 'bin');
+  await mkdir(bin);
+  await writeFile(join(bin, 'tmux'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { writeFileSync } = await import('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('kill-session')) writeFileSync(${JSON.stringify(marker)}, 'stopping');
+process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).status ?? 1);
+`, { mode: 0o700 });
+  await writeFile(join(bin, 'ps'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { existsSync, readFileSync } = await import('node:fs');
+const args = process.argv.slice(2);
+if (existsSync(${JSON.stringify(marker)}) && args[args.indexOf('-p') + 1] === readFileSync(${JSON.stringify(pidFile)}, 'utf8')) process.exit(1);
+process.exit(spawnSync(${JSON.stringify(ps)}, args, { stdio: 'inherit' }).status ?? 1);
+`, { mode: 0o700 });
+  let pid: number | undefined;
+  try {
+    await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+      env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
+    });
+    await cli(state, 'up', config, '--json');
+    await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+    await expect.poll(() => readFile(pidFile, 'utf8').catch(() => '')).not.toBe('');
+    pid = Number(await readFile(pidFile, 'utf8'));
+    await expect(cli(state, 'down', '--crew', 'sample')).rejects.toMatchObject({ code: 1 });
+    expect(() => process.kill(pid!, 0)).not.toThrow();
+    await expect(cli(state, 'status', '--json')).rejects.toMatchObject({ stdout: expect.stringContaining('"status":"unknown"') });
+    await expect(cli(state, 'up', config)).rejects.toMatchObject({ stderr: expect.stringContaining('unexplained') });
+  } finally {
+    pid ??= Number(await readFile(pidFile, 'utf8').catch(() => '0'));
+    if (pid > 0) process.kill(pid, 'SIGKILL');
+  }
+}, 25000);
+
 test('HTTP shutdown authorization and daemon restart preserve verified execution identities', async () => {
   const { directory, state, config, binary } = await fixture();
   await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
@@ -612,6 +680,8 @@ test('a missing or mismatched terminal is reported and never silently replaced',
   await expect(cli(state, 'status', '--json')).rejects.toMatchObject({ stdout: expect.stringContaining('"status":"unknown"') });
   await expect(cli(state, 'up', config)).rejects.toMatchObject({ stderr: expect.stringContaining('unexplained') });
   await expect(cli(state, 'down', '--crew', 'sample')).rejects.toMatchObject({ stderr: expect.stringContaining('unverified') });
+  await expect(cli(state, 'attach', 'investigator')).rejects.toMatchObject({ stderr: expect.stringContaining('no active terminal (unknown)') });
+  await expect(cli(state, 'detach', 'investigator')).rejects.toMatchObject({ stderr: expect.stringContaining('no active terminal (unknown)') });
   expect((await exec('tmux', ['-S', terminal.socket, 'list-sessions', '-F', '#{session_name}'])).stdout.trim()).toBe(terminal.session);
 }, 25000);
 
