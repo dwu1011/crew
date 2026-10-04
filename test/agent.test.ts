@@ -483,3 +483,192 @@ test.each([
     await exec('tmux', ['-S', views, 'kill-server'], { timeout: 5000 }).catch(() => {});
   }
 }, 25000);
+
+
+test('matching startup reuses executions and changed configuration cannot replace them', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const reused = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
+  expect(reused.seats.map((seat: { executionId: string }) => seat.executionId)).toEqual(before.seats.map((seat: { executionId: string }) => seat.executionId));
+  const concurrent = await Promise.all([cli(state, 'up', config, '--json'), cli(state, 'up', config, '--json')]);
+  for (const result of concurrent) expect(JSON.parse(result.stdout).seats.map((seat: { executionId: string }) => seat.executionId)).toEqual(before.seats.map((seat: { executionId: string }) => seat.executionId));
+  expect((await exec('tmux', ['-S', before.seats[0].tmux.socket, 'list-sessions'])).stdout.trim().split('\n')).toHaveLength(3);
+  await writeFile(join(directory, 'planner.md'), 'Changed planner instructions.');
+  await expect(cli(state, 'up', config)).rejects.toMatchObject({ stderr: expect.stringContaining('configuration') });
+  const after = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  expect(after.seats.map((seat: { executionId: string }) => seat.executionId)).toEqual(before.seats.map((seat: { executionId: string }) => seat.executionId));
+}, 25000);
+
+
+test('crew shutdown retains history, preserves other crews, and relaunch revokes old identities', async () => {
+  const { directory, state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout);
+  const credential = await readFile(join(directory, 'native-credential'), 'utf8');
+  const other = join(directory, 'other.yaml');
+  await writeFile(other, (await readFile(config, 'utf8')).replace('name: sample', 'name: other'));
+  await cli(state, 'up', other, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'other', '--json')).stdout).status).toBe('ready');
+  const stopped = JSON.parse((await cli(state, 'down', '--crew', 'sample', '--json')).stdout);
+  expect(stopped.status).toBe('stopped');
+  expect(stopped.seats[0].history).toMatchObject([{ executionId: before.seats[0].executionId, status: 'stopped' }]);
+  expect(JSON.parse((await cli(state, 'status', '--crew', 'other', '--json')).stdout).status).toBe('ready');
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  expect((await fetch(`${discovery.url}/whoami`, { headers: { Authorization: `Bearer ${credential}` } })).status).toBe(401);
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout).status).toBe('ready');
+  const after = JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout);
+  expect(after.id).toBe(before.id);
+  expect(after.seats[0].seatId).toBe(before.seats[0].seatId);
+  expect(after.seats[0].executionId).not.toBe(before.seats[0].executionId);
+  expect(after.seats[0].generation).not.toBe(before.seats[0].generation);
+  expect(after.seats[0].history).toHaveLength(2);
+  expect((await fetch(`${discovery.url}/whoami`, { headers: { Authorization: `Bearer ${credential}` } })).status).toBe(401);
+}, 25000);
+
+test('shutdown reports stopping until the managed terminal actually exits', async () => {
+  const { directory, state, config, binary } = await fixture();
+  const tmux = (await exec('which', ['tmux'])).stdout.trim();
+  const bin = join(directory, 'bin');
+  const marker = join(directory, 'shutdown-started');
+  const release = join(directory, 'shutdown-release');
+  await mkdir(bin);
+  await writeFile(join(bin, 'tmux'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { writeFileSync, existsSync } = await import('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('kill-session')) {
+  writeFileSync(${JSON.stringify(marker)}, 'stopping');
+  const deadline = Date.now() + 1500;
+  while (!existsSync(${JSON.stringify(release)}) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+}
+process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).status ?? 1);
+`, { mode: 0o700 });
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const headers = { Authorization: `Bearer ${discovery.token}` };
+  const shutdown = fetch(`${discovery.url}/crews/down`, { method: 'POST', headers, body: JSON.stringify({ crew: 'sample' }) });
+  try {
+    await expect.poll(() => readFile(marker, 'utf8').catch(() => null)).toBe('stopping');
+    const during = await (await fetch(`${discovery.url}/crews/sample`, { headers })).json();
+    expect(during.status).toBe('stopping');
+    expect(during.seats[0].status).toBe('stopping');
+    await exec('tmux', ['-S', during.seats[0].tmux.socket, 'has-session', '-t', during.seats[0].tmux.session]);
+  } finally {
+    await writeFile(release, 'release');
+    expect(await (await shutdown).json()).toMatchObject({ status: 'stopped' });
+  }
+}, 25000);
+
+test('HTTP shutdown authorization and daemon restart preserve verified execution identities', async () => {
+  const { directory, state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const credential = await readFile(join(directory, 'native-credential'), 'utf8');
+  let discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const denied = await fetch(`${discovery.url}/crews/down`, { method: 'POST', headers: { Authorization: `Bearer ${credential}` }, body: JSON.stringify({ crew: 'sample' }) });
+  expect(denied.status).toBe(401);
+  await cli(state, 'daemon', 'stop');
+  expect((await exec('tmux', ['-S', before.seats[0].tmux.socket, 'list-sessions', '-F', '#{session_name}'])).stdout).toContain(before.seats[0].tmux.session);
+  await cli(state, 'daemon', 'start');
+  discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const after = await (await fetch(`${discovery.url}/crews/sample`, { headers: { Authorization: `Bearer ${discovery.token}` } })).json();
+  expect(after.seats[0]).toMatchObject({ status: 'ready', executionId: before.seats[0].executionId, generation: before.seats[0].generation });
+  expect((await fetch(`${discovery.url}/whoami`, { headers: { Authorization: `Bearer ${credential}` } })).status).toBe(200);
+  const stopped = await fetch(`${discovery.url}/crews/down`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify({ crew: 'sample' }) });
+  expect(await stopped.json()).toMatchObject({ status: 'stopped' });
+}, 25000);
+
+test('a missing or mismatched terminal is reported and never silently replaced', async () => {
+  const { state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const terminal = before.seats[0].tmux;
+  await cli(state, 'daemon', 'stop');
+  await exec('tmux', ['-S', terminal.socket, 'kill-session', '-t', terminal.session]);
+  await exec('tmux', ['-f', '/dev/null', '-S', terminal.socket, 'new-session', '-d', '-s', terminal.session, 'sleep', '60']);
+  await cli(state, 'daemon', 'start');
+  await expect(cli(state, 'status', '--json')).rejects.toMatchObject({ stdout: expect.stringContaining('"status":"unknown"') });
+  await expect(cli(state, 'up', config)).rejects.toMatchObject({ stderr: expect.stringContaining('unexplained') });
+  await expect(cli(state, 'down', '--crew', 'sample')).rejects.toMatchObject({ stderr: expect.stringContaining('unverified') });
+  expect((await exec('tmux', ['-S', terminal.socket, 'list-sessions', '-F', '#{session_name}'])).stdout.trim()).toBe(terminal.session);
+}, 25000);
+
+
+test('repeated startup completes a known launch failure without replacing healthy seats', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  const tmux = (await exec('which', ['tmux'])).stdout.trim();
+  const bin = join(directory, 'bin');
+  const marker = join(directory, 'fail-once');
+  await mkdir(bin);
+  await writeFile(marker, 'fail');
+  await writeFile(join(bin, 'tmux'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { readFileSync, existsSync, unlinkSync } = await import('node:fs');
+const args = process.argv.slice(2);
+const coder = args.includes('new-session') && JSON.parse(readFileSync(args.at(-1), 'utf8')).env.CREW_SEAT === 'coder';
+if (coder && existsSync(${JSON.stringify(marker)})) { unlinkSync(${JSON.stringify(marker)}); process.exit(12); }
+process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).status ?? 1);
+`, { mode: 0o700 });
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
+  });
+  await expect(cli(state, 'up', config, '--json')).rejects.toMatchObject({ code: 1 });
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const headers = { Authorization: `Bearer ${discovery.token}` };
+  const before = await (await fetch(`${discovery.url}/crews/sample`, { headers })).json();
+  const retried = await fetch(`${discovery.url}/crews/up`, { method: 'POST', headers,
+    body: JSON.stringify({ configPath: config }) });
+  expect(retried.status, JSON.stringify(await retried.json())).toBe(200);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const after = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  expect(after.seats[0].executionId).toBe(before.seats[0].executionId);
+  expect(after.seats[2].executionId).toBe(before.seats[2].executionId);
+  expect(after.seats[1].executionId).not.toBe(before.seats[1].executionId);
+  expect(after.seats[1].seatId).toBe(before.seats[1].seatId);
+  expect(after.seats[1].history).toHaveLength(2);
+}, 25000);
+
+
+test('missing executions require an explicit crew shutdown before a fresh launch', async () => {
+  const { state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  await cli(state, 'daemon', 'stop');
+  await exec('tmux', ['-S', before.seats[0].tmux.socket, 'kill-session', '-t', before.seats[0].tmux.session]);
+  await cli(state, 'daemon', 'start');
+  await expect(cli(state, 'status', '--json')).rejects.toMatchObject({ stdout: expect.stringContaining('"status":"unknown"') });
+  await expect(cli(state, 'up', config)).rejects.toMatchObject({ stderr: expect.stringContaining('unexplained') });
+  await cli(state, 'down', '--crew', 'sample');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'stop']);
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  const launched = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
+  expect(launched.seats[0].executionId).not.toBe(before.seats[0].executionId);
+}, 25000);

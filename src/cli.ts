@@ -20,6 +20,12 @@ program.command('up <configuration>').description('Launch configured Claude Code
     else console.log(JSON.stringify(result, null, 2));
     if (result.seats.some((seat: { status: string }) => seat.status === 'failed')) process.exitCode = 1;
   });
+program.command('down').description('Stop one crew while retaining execution history')
+  .requiredOption('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
+  .action(async (options: { crew: string; json?: boolean }) => {
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), '/crews/down', { crew: options.crew }, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
 for (const [name, path, description] of [
   ['status', '/crews', 'Inspect a configured crew'],
   ['members', '/members', 'Discover crew members and their roles'],
@@ -30,7 +36,7 @@ for (const [name, path, description] of [
       const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
       const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `${path}${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
       console.log(JSON.stringify(result, null, options.json ? undefined : 2));
-      if (name === 'status' && result.status === 'failed') process.exitCode = 1;
+      if (name === 'status' && ['failed', 'unknown'].includes(result.status)) process.exitCode = 1;
     });
 }
 for (const name of ['attach', 'detach']) {
