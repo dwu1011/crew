@@ -45,11 +45,20 @@ program.command('inbox').description('Inspect incoming messages without acknowle
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/inbox?${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
-program.command('message').description('Inspect persisted messages').command('show <id>')
+const messageCommands = program.command('message').description('Inspect and retry persisted messages');
+messageCommands.command('show <id>')
   .option('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
   .action(async (id: string, options: { crew?: string; json?: boolean }) => {
     const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
+messageCommands.command('retry <id>').description('Create a new attempt for failed or explicitly accepted uncertain delivery')
+  .option('--crew <name>', 'Crew name').option('--allow-duplicate', 'Accept that uncertain delivery may produce a duplicate')
+  .option('--json', 'Machine-readable output')
+  .action(async (id: string, options: { crew?: string; allowDuplicate?: boolean; json?: boolean }) => {
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}/retry`,
+      { crew: options.crew, allowDuplicate: options.allowDuplicate ?? false }, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
 program.command('up <configuration>').description('Launch configured Claude Code seats')

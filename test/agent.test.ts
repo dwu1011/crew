@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { connect } from 'node:net';
 import { afterEach, expect, test } from 'vitest';
 
 const exec = promisify(execFile);
@@ -98,7 +99,7 @@ async function cli(state: string, ...args: string[]) {
   return exec(process.execPath, [cliPath, '--state-dir', state, ...args], { timeout: 15000 });
 }
 
-async function deliveryFault(phase: 'load' | 'paste' | 'target' | 'enter' | 'draft' | 'collapsed') {
+async function deliveryFault(phase: 'load' | 'paste' | 'target' | 'enter' | 'draft' | 'collapsed' | 'crash-before-paste' | 'crash-after-paste' | 'crash-after-enter' | 'ack-race') {
   const item = await fixture(phase === 'collapsed' ? 'delivery-slow' : 'delivery');
   const tmux = (await exec('which', ['tmux'])).stdout.trim();
   const bin = join(item.directory, 'fault-bin');
@@ -115,6 +116,21 @@ const replace = (socket) => {
   run(['-S', socket, 'kill-session', '-t', '=' + session]);
   run(['-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', session, 'sleep', '60']);
 };
+if (phase.startsWith('crash-') && args.includes('if-shell') && !existsSync(${JSON.stringify(marker)})) {
+  const paste = args.some(arg => arg.includes('paste-buffer'));
+  const enter = args.some(arg => arg.includes('send-keys'));
+  if ((phase !== 'crash-after-enter' && paste) || (phase === 'crash-after-enter' && enter)) {
+    if (phase !== 'crash-before-paste') run(args);
+    writeFileSync(${JSON.stringify(marker)}, phase);
+    process.kill(process.ppid, 'SIGKILL');
+    process.exit(15);
+  }
+}
+if (phase === 'ack-race' && args.includes('load-buffer')) {
+  writeFileSync(${JSON.stringify(marker)}, 'prepared');
+  const deadline = Date.now() + 1500;
+  while (!existsSync(${JSON.stringify(release)}) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+}
 if (phase === 'load' && args.includes('load-buffer')) process.exit(13);
 if (phase === 'paste' && args.includes('if-shell') && args.some(arg => arg.includes('paste-buffer'))) {
   writeFileSync(${JSON.stringify(marker)}, 'submitting');
@@ -1258,3 +1274,204 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
   await expect.poll(async () => (await show()).deliveries[0], { timeout: 8000 }).toMatchObject({ status: 'submitted', executionId: before.executionId, generation: before.generation });
   expect(JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'))).toHaveLength(1);
 }, 30000);
+
+test('explicit definite-failure retry preserves history, rejects active or acknowledged messages, and enforces scope', async () => {
+  const { directory, state, config } = await deliveryFault('load');
+  await cli(state, 'up', config);
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Retry this definite failure.', '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status, { timeout: 8000 }).toBe('failed');
+  const failed = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
+  expect(JSON.parse((await cli(state, 'status', '--json')).stdout).deliveryIssues.map((m: { id: string }) => m.id)).toContain(sent.id);
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const retry = (body: unknown, token = discovery.token) => fetch(`${discovery.url}/messages/${sent.id}/retry`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+  expect((await retry({ allowDuplicate: 'yes' })).status).toBe(400);
+  expect((await retry({}, 'invalid')).status).toBe(401);
+  expect((await retry({ crew: 'missing' })).status).toBe(404);
+  const credential = await readFile(join(directory, 'native-credential'), 'utf8');
+  expect((await retry({ crew: 'other' }, credential)).status).toBe(403);
+  const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, '-l', 'HOLD_RETRY']);
+  const retried = JSON.parse((await cli(state, 'message', 'retry', sent.id, '--json')).stdout);
+  expect(retried.id).toBe(sent.id);
+  expect(retried.deliveries).toHaveLength(2);
+  expect(retried.deliveries[0]).toEqual(failed.deliveries[0]);
+  expect(retried.deliveries[1]).toMatchObject({ status: 'pending', executionId: null });
+  const concurrent = await Promise.all([retry({}), retry({ allowDuplicate: true })]);
+  expect(concurrent.map((r) => r.status)).toEqual([409, 409]);
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'ack', sent.id, '--json'], { env: { ...process.env, CREW_EXECUTION_TOKEN: credential } });
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[1].status).toBe('pending');
+  await expect(cli(state, 'message', 'retry', sent.id, '--allow-duplicate')).rejects.toMatchObject({ stderr: expect.stringMatching(/acknowledged/i) });
+  expect(JSON.parse((await cli(state, 'status', '--json')).stdout).deliveryIssues).toHaveLength(0);
+  await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+}, 25000);
+
+test.each(['crash-before-paste', 'crash-after-paste', 'crash-after-enter'] as const)('isolated %s becomes uncertain without blind resend and requires explicit duplicate acceptance', async (phase) => {
+  const { directory, state, config, marker } = await deliveryFault(phase);
+  await cli(state, 'up', config);
+  await expect.poll(() => readFile(join(directory, 'current-draft.txt'), 'utf8').catch(() => null)).toBe('');
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Preserve crash message.', '--json')).stdout);
+  await expect.poll(() => readFile(marker, 'utf8').catch(() => ''), { timeout: 8000 }).toBe(phase);
+  await expect.poll(() => { try { process.kill(discovery.pid, 0); return true; } catch { return false; } }).toBe(false);
+  await cli(state, 'daemon', 'start');
+  const shown = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
+  expect(shown.body).toBe('Preserve crash message.');
+  expect(shown.deliveries).toMatchObject([{ status: 'uncertain', submittingAt: expect.any(String), failure: expect.stringContaining('restarted') }]);
+  expect(shown.deliveries).toHaveLength(1);
+  expect(JSON.parse((await cli(state, 'status', '--json')).stdout).deliveryIssues).toMatchObject([{ id: sent.id, deliveries: [{ status: 'uncertain' }] }]);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  if (phase === 'crash-after-enter') await expect.poll(async () => JSON.parse(await readFile(join(directory, 'received.json'), 'utf8')).length).toBe(1);
+  else await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(cli(state, 'message', 'retry', sent.id)).rejects.toMatchObject({ stderr: expect.stringContaining('--allow-duplicate') });
+  const current = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const refused = await fetch(`${current.url}/messages/${sent.id}/retry`, { method: 'POST', headers: { Authorization: `Bearer ${current.token}` }, body: '{}' });
+  expect(refused.status).toBe(409);
+  const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
+  const retry = await fetch(`${current.url}/messages/${sent.id}/retry`, { method: 'POST', headers: { Authorization: `Bearer ${current.token}` }, body: JSON.stringify({ allowDuplicate: true }) });
+  expect(retry.status).toBe(200);
+  const retried = await retry.json();
+  expect(retried.id).toBe(sent.id);
+  expect(retried.deliveries).toHaveLength(2);
+  expect(retried.deliveries[0]).toEqual(shown.deliveries[0]);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[1].status, { timeout: 8000 }).toBe('submitted');
+  await expect.poll(async () => JSON.parse(await readFile(join(directory, 'received.json'), 'utf8')).length).toBe(phase === 'crash-after-enter' ? 2 : 1);
+  const records = JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'));
+  expect(records.every((body: string) => body.includes(sent.id))).toBe(true);
+  const credential = await readFile(join(directory, 'native-credential'), 'utf8');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'ack', sent.id, '--json'], { env: { ...process.env, CREW_EXECUTION_TOKEN: credential } });
+  await expect(cli(state, 'message', 'retry', sent.id, '--allow-duplicate')).rejects.toMatchObject({ stderr: expect.stringMatching(/acknowledged/i) });
+}, 30000);
+
+test.each(['before-commit', 'after-commit-before-input'] as const)('isolated %s crash preserves the acceptance boundary and recovers a single pending message', async (phase) => {
+  const { directory, state, config, binary } = await fixture('delivery');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  await cli(state, 'up', config);
+  await expect.poll(() => readFile(join(directory, 'current-draft.txt'), 'utf8').catch(() => null)).toBe('');
+  const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, '-l', 'HOLD_CRASH']);
+  let discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const body = { recipient: 'investigator', body: 'Acceptance boundary.', requestId: 'crash-request' };
+  let original: { id: string } | undefined;
+  const socket = connect(Number(new URL(discovery.url).port), '127.0.0.1');
+  await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+  try {
+    if (phase === 'before-commit') {
+      const payload = JSON.stringify(body);
+      socket.write(`POST /messages HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${discovery.token}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload.slice(0, -1)}`);
+      expect((await fetch(`${discovery.url}/health`)).status).toBe(200);
+    } else {
+      original = await (await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify(body) })).json();
+    }
+    process.kill(discovery.pid, 'SIGKILL');
+    await expect.poll(() => { try { process.kill(discovery.pid, 0); return true; } catch { return false; } }).toBe(false);
+  } finally { socket.destroy(); }
+  await cli(state, 'daemon', 'start');
+  discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const inbox = JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages;
+  expect(inbox).toHaveLength(original ? 1 : 0);
+  const recovered = await (await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify(body) })).json();
+  if (original) expect(recovered.id).toBe(original.id);
+  expect(recovered.deliveries).toHaveLength(1);
+  expect(recovered.deliveries[0].status).toBe('pending');
+  expect(JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0].executionId).toBe(seat.executionId);
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', recovered.id, '--json')).stdout).deliveries[0].status, { timeout: 8000 }).toBe('submitted');
+  await expect(cli(state, 'message', 'retry', recovered.id, '--allow-duplicate')).rejects.toMatchObject({ stderr: expect.stringContaining('Only a definite failure') });
+  expect(JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'))).toHaveLength(1);
+}, 25000);
+
+test.skipIf(process.env.CREW_NATIVE_MVP_SMOKE !== '1')('native crew messaging and recovery smoke', async () => {
+  const { directory, state, project, config } = await multiFixture();
+  await writeFile(join(project, 'math.ts'), 'export const add = (a: number, b: number) => a - b;\n');
+  const common = 'Read-only validation. Never edit project files. Use crew CLI for coordination. Keep each message body line under 80 characters. Do not send more messages than the requested smoke flow.\n';
+  await writeFile(join(directory, 'planner.md'), common + 'When the operator requests validation, send coder one request to inspect math.ts and reply via crew reply. When coder replies, acknowledge that reply and send one linked reply to the original operator request with your findings. Then stop.\n');
+  await writeFile(join(directory, 'coder.md'), common + 'When planner requests inspection, read math.ts, reply to that message with findings, then send reviewer one request to review math.ts and reply via crew reply. Acknowledge reviewer reply and then stop.\n');
+  await writeFile(join(directory, 'reviewer.md'), common + 'When coder requests review, read math.ts and send one linked reply to that request with findings. Then stop.\n');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: process.env.CREW_NATIVE_BIN ?? 'claude' } });
+  await cli(state, 'up', config);
+  let crew = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  for (const seat of crew.seats) {
+    await exec('tmux', ['-S', seat.tmux.socket, 'resize-window', '-t', seat.tmux.session, '-x', '240', '-y', '80']);
+  }
+  await expect.poll(async () => {
+    const status = JSON.parse((await cli(state, 'status', '--json')).stdout);
+    for (const seat of status.seats) {
+      if (seat.status !== 'launching') continue;
+      const screen = (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout;
+      if (screen.includes(project) && /Quick safety check|Do you trust/.test(screen)) {
+        if (/❯\s*No, exit/.test(screen) && /Yes, I trust this folder/.test(screen))
+          await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'Down', 'Enter']);
+        else if (/❯\s*1\.\s*Yes/.test(screen))
+          await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'Enter']);
+      }
+    }
+    return status.status;
+  }, { timeout: 45000, interval: 500 }).toBe('ready');
+  crew = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  expect(crew.seats.every((seat: { nativeVersion: string }) => seat.nativeVersion === '2.1.289')).toBe(true);
+  for (const seat of crew.seats) {
+    await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, '-l', 'Only reply READY and wait. Do not perform the smoke flow yet. No tools or edits.']);
+    await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'Enter']);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  const request = JSON.parse((await cli(state, 'send', 'planner', '--text', 'Run the read-only smoke flow now. Ask coder to inspect math.ts.\nHave coder reply and request reviewer review.\nHave reviewer reply to coder; report back to this operator request.', '--request-id', 'native-mvp-request', '--json')).stdout);
+  let conversation: any[] = [];
+  await expect.poll(async () => {
+    conversation = JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages;
+    for (const seat of crew.seats) {
+      const pending = conversation.some((message) => message.recipient.seat === seat.name && message.deliveries.some((attempt: { status: string }) => attempt.status === 'pending') && !message.acknowledgedAt);
+      if (!pending) continue;
+      const screen = (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout;
+      const tail = screen.split('\n').filter((line: string) => line.trim()).slice(-12).join('\n');
+      if (/-- INSERT --/.test(tail) && !/esc to interrupt|[✳✻✽✶].*…/.test(tail) && /^❯.+$/m.test(tail))
+        await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
+    }
+    const coderReply = conversation.find((m) => m.sender.seat === 'coder' && m.recipient.seat === 'planner' && m.replyTo);
+    const reviewRequest = conversation.find((m) => m.sender.seat === 'coder' && m.recipient.seat === 'reviewer');
+    const reviewReply = conversation.find((m) => m.sender.seat === 'reviewer' && m.replyTo === reviewRequest?.id);
+    const operatorReply = conversation.find((m) => m.sender.seat === 'planner' && m.replyTo === request.id && m.recipient.kind === 'operator');
+    return !!(coderReply && reviewRequest && reviewReply && operatorReply);
+  }, { timeout: 180000, interval: 1000 }).toBe(true);
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const history = conversation.map((m) => ({ id: m.id, body: m.body, replyTo: m.replyTo, acknowledgedAt: m.acknowledgedAt }));
+  await cli(state, 'daemon', 'stop');
+  await cli(state, 'daemon', 'start');
+  const after = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  expect(after.seats.map((seat: any) => [seat.seatId, seat.executionId, seat.generation, seat.nativeSessionId])).toEqual(before.seats.map((seat: any) => [seat.seatId, seat.executionId, seat.generation, seat.nativeSessionId]));
+  const persisted = JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages;
+  for (const message of history) expect(persisted.find((m: any) => m.id === message.id)).toMatchObject(message);
+  const unread = JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages;
+  expect(unread.every((m: any) => m.acknowledgedAt === null)).toBe(true);
+  const source = await readFile(join(project, 'math.ts'), 'utf8');
+  expect(source).toBe('export const add = (a: number, b: number) => a - b;\n');
+  console.log(JSON.stringify({ nativeSmoke: 'passed', identitiesPreserved: true, messages: history.map((m) => ({ id: m.id, replyTo: m.replyTo })), unread: unread.map((m: any) => m.id) }));
+  await cli(state, 'down', '--crew', 'sample');
+}, 240000);
+
+test('acknowledgment during preparation prevents queued input and delivery issue inspection stays participant scoped', async () => {
+  const { directory, state, config, marker, release } = await deliveryFault('ack-race');
+  await cli(state, 'up', config);
+  await expect.poll(() => readFile(join(directory, 'current-draft.txt'), 'utf8').catch(() => null)).toBe('');
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Ack before input.', '--json')).stdout);
+  try {
+    await expect.poll(() => readFile(marker, 'utf8').catch(() => ''), { timeout: 8000 }).toBe('prepared');
+    const credential = await readFile(join(directory, 'native-credential'), 'utf8');
+    await exec(process.execPath, [cliPath, '--state-dir', state, 'ack', sent.id, '--json'], { env: { ...process.env, CREW_EXECUTION_TOKEN: credential } });
+  } finally { await writeFile(release, 'release'); }
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status).toBe('pending');
+  expect(await readFile(join(directory, 'current-draft.txt'), 'utf8')).toBe('');
+  await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  const other = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', other.state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: other.binary } });
+  await cli(other.state, 'up', other.config);
+  await expect.poll(async () => JSON.parse((await cli(other.state, 'status', '--json')).stdout).status).toBe('ready');
+  const scoped = JSON.parse((await cli(other.state, 'send', 'coder', '--text', 'Private pending message.', '--json')).stdout);
+  const reviewer = await readFile(join(other.directory, 'credential-reviewer'), 'utf8');
+  const discovery = JSON.parse(await readFile(join(other.state, 'daemon.json'), 'utf8'));
+  expect((await fetch(`${discovery.url}/messages/${scoped.id}/retry`, { method: 'POST', headers: { Authorization: `Bearer ${reviewer}` }, body: '{}' })).status).toBe(404);
+  expect((await (await fetch(`${discovery.url}/crews`, { headers: { Authorization: `Bearer ${reviewer}` } })).json()).deliveryIssues).toHaveLength(0);
+}, 25000);
