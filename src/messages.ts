@@ -81,9 +81,10 @@ export class Messages {
     return { id: row.id, requestId: row.request_id, crew: row.crew,
       sender: { kind: row.sender_seat_id ? 'agent' : 'operator', seat: row.sender, seatId: row.sender_seat_id, executionId: row.sender_execution_id },
       recipient: { seat: row.recipient, seatId: row.recipient_seat_id }, body: row.body, createdAt: row.created_at, acknowledgedAt: row.acknowledged_at,
-      deliveries: (this.db.prepare('SELECT id, execution_id, status, created_at, failure FROM delivery_attempts WHERE message_id = ? ORDER BY rowid').all(id) as
-        { id: string; execution_id: string | null; status: string; created_at: string; failure: string | null }[])
-        .map((attempt) => ({ id: attempt.id, executionId: attempt.execution_id, status: attempt.status, createdAt: attempt.created_at, failure: attempt.failure })),
+      deliveries: (this.db.prepare('SELECT id, execution_id, generation, pane, status, created_at, submitting_at, submitted_at, failure FROM delivery_attempts WHERE message_id = ? ORDER BY rowid').all(id) as
+        { id: string; execution_id: string | null; generation: string | null; pane: string | null; status: string; created_at: string; submitting_at: string | null; submitted_at: string | null; failure: string | null }[])
+        .map((attempt) => ({ id: attempt.id, executionId: attempt.execution_id, generation: attempt.generation, pane: attempt.pane, status: attempt.status, createdAt: attempt.created_at,
+          submittingAt: attempt.submitting_at, submittedAt: attempt.submitted_at, failure: attempt.failure })),
     };
   }
 

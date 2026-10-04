@@ -8,6 +8,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { processAlive } from './state.js';
 import { Crews } from './crews.js';
 import { Messages } from './messages.js';
+import { Delivery } from './delivery.js';
 import { z } from 'zod';
 import { HTTPException } from 'hono/http-exception';
 
@@ -54,6 +55,7 @@ const token = randomBytes(32).toString('hex');
 const app = new Hono();
 const crews = new Crews(db, directory);
 const messages = new Messages(db);
+const delivery = new Delivery(db, crews, directory);
 await crews.reconcileAll();
 let stopping = false;
 let url = '';
@@ -108,7 +110,9 @@ app.post('/messages', async (context) => {
   const parsed = submission.safeParse(await context.req.json());
   if (!parsed.success) return context.json({ error: 'Expected recipient, body, requestId, and optional crew only' }, 400);
   const body = parsed.data;
-  return context.json(messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId));
+  const message = messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId);
+  delivery.enqueue(message.id);
+  return context.json(message);
 });
 app.get('/messages/:id', (context) => context.json(messages.show(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.param('id'))));
 app.get('/inbox', (context) => context.json(messages.inbox(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.query('all') === 'true')));
@@ -150,11 +154,13 @@ server.on('error', (error) => {
 function shutdown() {
   if (stopping) return;
   stopping = true;
+  const delivering = delivery.stop();
   const drainDeadline = setTimeout(() => server.closeAllConnections(), 1000);
   drainDeadline.unref();
   server.close(async () => {
     clearTimeout(drainDeadline);
     await crews.drain();
+    await delivering;
     db.prepare('UPDATE daemon_lifecycle SET pid = NULL, stopped_at = ? WHERE singleton = 1 AND boot_id = ?')
       .run(new Date().toISOString(), bootId);
     db.close();
