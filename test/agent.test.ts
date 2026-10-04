@@ -45,7 +45,7 @@ if (${JSON.stringify(mode)} === 'discovery') {
   if (members.status !== 0) { console.error(members.stderr); process.exit(1); }
 }
 if (${JSON.stringify(mode)}.startsWith('delivery')) {
-  const render = (draft = '', footer = '-- INSERT -- ⏵⏵ auto mode on') => process.stdout.write('\\x1b[2J\\x1b[HClaude Code v2.1.289\\n────────────────────────────────────────\\n❯ ' + draft.replaceAll('\\n', '\\n  ') + '\\n────────────────────────────────────────\\n  Model: Opus 5.5 | Thinking: medium\\n  Context: [░░░░]\\n  ' + footer + '\\x1b[3;3H\\x1b[?2004h');
+  const render = (visible = '', footer = '-- INSERT -- ⏵⏵ auto mode on') => { writeFileSync(${JSON.stringify(join(directory, 'current-draft.txt'))}, draft); process.stdout.write('\\x1b[2J\\x1b[HClaude Code v2.1.289\\n────────────────────────────────────────\\n❯ ' + visible.replaceAll('\\n', '\\n  ') + '\\n────────────────────────────────────────\\n  Model: Opus 5.5 | Thinking: medium\\n  Context: [░░░░]\\n  ' + footer + '\\x1b[3;3H\\x1b[?2004h'); };
   process.stdin.setRawMode(true);
   let draft = '', pasting = false, paste = '', collapsed = false, received = [];
   render();
@@ -78,6 +78,11 @@ if (${JSON.stringify(mode)}.startsWith('delivery')) {
         setTimeout(() => { if (collapsed) render('[Pasted text #1 +6 lines]', 'paste again to expand'); }, 650);
         return;
       }
+    }
+    if (${JSON.stringify(mode)} === 'delivery-slow') {
+      process.stdout.write('\\x1b[2J\\x1b[HRendering input...');
+      setTimeout(() => { if (!collapsed) render(draft); }, 650);
+      return;
     }
     render(draft);
   });
@@ -1068,7 +1073,8 @@ test.each(['enter', 'draft', 'collapsed'] as const)('delivery refuses Enter afte
   await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   const capture = (await exec('tmux', ['-S', join(state, 'tmux.sock'), 'capture-pane', '-p', '-J', '-t', '%0'])).stdout;
   if (phase === 'enter') expect(capture).not.toContain(sent.id);
-  else expect(capture).toContain(phase === 'collapsed' ? 'HUMAN_REPLACEMENT' : 'USER_EXTRA');
+  else expect(capture).toContain(phase === 'collapsed' ? '[Pasted text #1' : 'USER_EXTRA');
+  if (phase === 'collapsed') expect(await readFile(join(directory, 'current-draft.txt'), 'utf8')).toBe('HUMAN_REPLACEMENT\nsecond line\nthird line\nfourth line');
 }, 20000);
 
 test('unsupported terminal versions remain pending and unsafe control bytes are never injected', async () => {
