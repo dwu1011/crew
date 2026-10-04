@@ -20,6 +20,16 @@
 - [ ] Stop and restart the daemon while agents remain alive; verify their terminals, identities, and generations are preserved.
 - [ ] Stop the crew, inspect retained records, and relaunch fresh executions; verify new execution identities and rejection of stale credentials.
 
+## Automated verification
+
+- Branch: `feat/ticket-4-crew-lifecycle`, based on ticket 3's `e1d74d4`.
+- Implementation commits: `8d8c123`, `e500585`, `1b8d9d2`.
+- `bun run typecheck`: passed.
+- Final `bun run test`: 40 passed, 1 opt-in native smoke test skipped. Tests use real tmux, a real daemon, temporary SQLite, and controlled native executable fixtures.
+- Standards and spec reviews against `e1d74d4`: no remaining findings after fixes. Regression tests cover delayed process receipts, shutdown in progress, native processes surviving terminal closure, and failed process inspection during startup or shutdown.
+- Ticket 3 PR: https://github.com/dwu1011/crew/pull/3.
+- Manual acceptance is pending; ticket 5 has not started.
+
 ## Completion gate
 
 Present exact commands and expected observations after automated checks pass. Stop for explicit manual acceptance before proceeding. No manual acceptance has been recorded.
@@ -58,14 +68,24 @@ Expected: Claude terminals survive, identity and generation stay unchanged, and 
 
 Crew shutdown and fresh launch:
 
+Capture one old credential locally before shutdown. These commands do not print the credential:
+
+```sh
+old_execution_id="$(bun run crew status --crew demo-crew --json | node -e 'let input="";process.stdin.on("data",c=>input+=c);process.stdin.on("end",()=>console.log(JSON.parse(input).seats[0].executionId));')"
+old_credential="$(node -e 'const fs=require("node:fs");const path=require("node:path");const manifest=JSON.parse(fs.readFileSync(path.join(process.env.CREW_HOME,"executions",process.argv[1],"launch.json"),"utf8"));process.stdout.write(manifest.env.CREW_EXECUTION_TOKEN);' "$old_execution_id")"
+```
+
 ```sh
 bun run crew down --crew demo-crew --json
 bun run crew status --crew demo-crew --json
+CREW_EXECUTION_TOKEN="$old_credential" bun run crew whoami --json
 bun run crew up examples/three-seat/crew.yaml --json
 bun run crew status --crew demo-crew --json
+CREW_EXECUTION_TOKEN="$old_credential" bun run crew whoami --json
+unset old_credential old_execution_id
 ```
 
-Expected: down stops only this crew's agents and retains history. Relaunch keeps stable crew/seat IDs while creating new execution IDs, generations, native sessions, and credentials. History includes previous executions, their native launch outcome, and failure reasons. Old credentials are rejected; restart alone does not change credentials. A managed seat cannot call the operator-only down endpoint.
+Expected: down reports stopping while shutdown is in progress, then stopped only after process exit is confirmed. It stops only this crew's agents and retains history. Relaunch keeps stable crew/seat IDs while creating new execution IDs, generations, native sessions, and credentials. History includes previous executions, their native launch outcome, and failure reasons. Both calls with the old credential must fail with an inactive-credential error and exit code 1; restart alone does not change credentials. A managed seat cannot call the operator-only down endpoint. Unverified or inactive seats are excluded from managed terminal attachment.
 
 Optional controlled partial-launch continuation: use ticket 3's startup-fault wrapper in fresh state, allow coder to fail, then edit the wrapper to remove its deliberate exit. Repeat `up` with unchanged crew YAML. Planner/reviewer retain execution identities; only the failed coder gets a fresh execution. Roles/configuration must remain unchanged. An unexpected native exit after readiness is reported as unknown and requires explicit down before replacement.
 
