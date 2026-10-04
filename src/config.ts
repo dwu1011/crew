@@ -11,7 +11,7 @@ const schema = z.object({
     runtime: z.literal('claude'),
     role_file: z.string().min(1),
     cwd: z.string().min(1).optional(),
-  }).strict()).refine((agents) => Object.keys(agents).length === 1, 'Ticket 2 supports exactly one seat'),
+  }).strict()).refine((agents) => Object.keys(agents).length > 0, 'A crew requires at least one seat'),
 }).strict();
 
 export async function loadConfig(configPath: string) {
@@ -32,15 +32,18 @@ export async function loadConfig(configPath: string) {
     }
   }
   const project = await directory(config.project, 'project');
-  const [seat, agent] = Object.entries(config.agents)[0];
-  const cwd = agent.cwd ? await directory(agent.cwd, 'working directory') : project;
-  const rolePath = resolve(base, agent.role_file);
-  let role: string;
-  try {
-    role = await readFile(rolePath, 'utf8');
-    if (!role.trim()) throw new Error('empty role');
-  } catch {
-    throw new Error(`Invalid role_file: ${agent.role_file} must reference a readable, nonempty file`);
+  const agents = [];
+  for (const [name, agent] of Object.entries(config.agents)) {
+    const cwd = agent.cwd ? await directory(agent.cwd, 'working directory') : project;
+    const rolePath = resolve(base, agent.role_file);
+    let role: string;
+    try {
+      role = await readFile(rolePath, 'utf8');
+      if (!role.trim()) throw new Error('empty role');
+    } catch {
+      throw new Error(`Invalid role_file for ${name}: ${agent.role_file} must reference a readable, nonempty file`);
+    }
+    agents.push({ name, runtime: agent.runtime, cwd, role, rolePath });
   }
-  return { name: config.name, project, seat, runtime: agent.runtime, cwd, role, rolePath, configPath };
+  return { name: config.name, project, agents, configPath };
 }

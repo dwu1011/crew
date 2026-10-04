@@ -83,6 +83,14 @@ app.get('/crews/:name', (context) => {
   return context.json(crews.status(context.req.param('name')));
 });
 const executionCredential = (header: string | undefined) => header?.startsWith('Bearer ') ? header.slice(7) : '';
+function selectedCrew(header: string | undefined, requested: string | undefined) {
+  if (header === `Bearer ${token}`) return crews.select(requested);
+  const caller = crews.whoami(executionCredential(header));
+  if (requested && requested !== caller.crew) throw new HTTPException(403, { message: 'Managed executions can only inspect their own crew' });
+  return caller.crew;
+}
+app.get('/crews', (context) => context.json(crews.status(selectedCrew(context.req.header('Authorization'), context.req.query('crew')))));
+app.get('/members', async (context) => context.json(await crews.members(selectedCrew(context.req.header('Authorization'), context.req.query('crew')))));
 app.get('/whoami', (context) => context.json(crews.whoami(executionCredential(context.req.header('Authorization')))));
 app.post('/executions/ready', async (context) => {
   const body = await context.req.json();

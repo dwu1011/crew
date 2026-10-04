@@ -9,7 +9,7 @@ const exec = promisify(execFile);
 const cliPath = resolve('dist/cli.js');
 const fixtures: { directory: string; state: string }[] = [];
 
-async function fixture(mode: 'normal' | 'hold' | 'exit' = 'normal') {
+async function fixture(mode: 'normal' | 'hold' | 'exit' | 'discovery' = 'normal') {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'crew-seat-')));
   const state = join(directory, 'state');
   const project = join(directory, 'project with spaces');
@@ -30,6 +30,7 @@ const prompt = readFileSync(option('--append-system-prompt-file'), 'utf8');
 const settings = JSON.parse(readFileSync(option('--settings'), 'utf8'));
 console.log('CREW_CONTEXT=' + JSON.stringify({ prompt, cwd: process.cwd(), args }));
 writeFileSync(${JSON.stringify(join(directory, 'native-credential'))}, process.env.CREW_EXECUTION_TOKEN, { mode: 0o600 });
+writeFileSync(${JSON.stringify(join(directory, 'credential-'))} + process.env.CREW_SEAT, process.env.CREW_EXECUTION_TOKEN, { mode: 0o600 });
 if (${JSON.stringify(mode)} === 'exit') process.exit(11);
 if (${JSON.stringify(mode)} === 'hold') { process.stdin.resume(); } else {
 const hook = settings.hooks.SessionStart[0].hooks[0].command;
@@ -38,6 +39,11 @@ if (result.status !== 0) { console.error(result.stderr); process.exit(1); }
 const identity = spawnSync('crew', ['whoami', '--json'], { encoding: 'utf8' });
 console.log('CREW_IDENTITY=' + identity.stdout.trim());
 if (identity.status !== 0) { console.error(identity.stderr); process.exit(1); }
+if (${JSON.stringify(mode)} === 'discovery') {
+  const members = spawnSync('crew', ['members', '--json'], { encoding: 'utf8' });
+  console.log('CREW_MEMBERS=' + members.stdout.trim());
+  if (members.status !== 0) { console.error(members.stderr); process.exit(1); }
+}
 process.stdin.resume();
 }
 `);
@@ -236,3 +242,145 @@ test.skipIf(process.env.CREW_NATIVE_SMOKE !== '1')('native Claude Code startup s
   await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'native-smoke', '--json')).stdout).seats[0].status,
     { timeout: 30000 }).toBe('ready');
 }, 45000);
+
+
+async function multiFixture(mode: 'normal' | 'discovery' = 'normal') {
+  const setup = await fixture(mode);
+  for (const seat of ['planner', 'coder', 'reviewer']) {
+    await writeFile(join(setup.directory, `${seat}.md`), `You are the ${seat}. Perform only your assigned role.\n`);
+  }
+  await writeFile(setup.config, `name: sample\nproject: project with spaces\nagents:\n${['planner', 'coder', 'reviewer'].map((seat) => `  ${seat}:\n    runtime: claude\n    role_file: ${seat}.md\n`).join('')}`);
+  return setup;
+}
+
+test('a complete crew launches distinct seats with their own roles and identities', async () => {
+  const { state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  const launched = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
+  expect(launched.seats.map((seat: { name: string }) => seat.name)).toEqual(['planner', 'coder', 'reviewer']);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout).status,
+    { timeout: 10000 }).toBe('ready');
+  const status = JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout);
+  for (const field of ['seatId', 'executionId', 'generation', 'nativeSessionId']) {
+    expect(new Set(status.seats.map((seat: Record<string, string>) => seat[field])).size).toBe(3);
+    expect(status.seats.every((seat: Record<string, string>) => Boolean(seat[field]))).toBe(true);
+  }
+  expect(new Set(status.seats.map((seat: { tmux: { session: string } }) => seat.tmux.session)).size).toBe(3);
+  for (const seat of status.seats) {
+    await expect.poll(async () => (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', seat.tmux.pane])).stdout,
+      { timeout: 10000 }).toContain('CREW_IDENTITY=');
+    const output = (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', seat.tmux.pane])).stdout;
+    expect(output).toContain(`You are the ${seat.name}`);
+    expect(output).toContain(`"seat":"${seat.name}"`);
+    expect(output).toContain(seat.executionId);
+  }
+}, 25000);
+
+
+test('managed members and status stay in their crew while humans resolve ambiguous selection explicitly', async () => {
+  const { directory, state, config, binary } = await multiFixture('discovery');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  const roster = JSON.parse((await cli(state, 'members', '--json')).stdout);
+  expect(roster).toMatchObject({ crew: 'sample', members: [
+    { seat: 'planner', role: 'You are the planner. Perform only your assigned role.\n' },
+    { seat: 'coder', role: 'You are the coder. Perform only your assigned role.\n' },
+    { seat: 'reviewer', role: 'You are the reviewer. Perform only your assigned role.\n' },
+  ] });
+  const status = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  for (const seat of status.seats) {
+    await expect.poll(async () => (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', seat.tmux.pane])).stdout,
+      { timeout: 10000 }).toContain('CREW_MEMBERS=');
+    const context = await readFile(seat.contextFile, 'utf8');
+    for (const teammate of ['planner', 'coder', 'reviewer']) expect(context).toContain(`You are the ${teammate}`);
+    expect(context).toContain('crew members --json');
+  }
+  const credential = await readFile(join(directory, 'credential-planner'), 'utf8');
+  const other = join(directory, 'other.yaml');
+  await writeFile(other, (await readFile(config, 'utf8')).replace('name: sample', 'name: other'));
+  await cli(state, 'up', other, '--json');
+  await expect(cli(state, 'members', '--json')).rejects.toMatchObject({ stderr: expect.stringContaining('--crew') });
+  await expect(cli(state, 'status', '--json')).rejects.toMatchObject({ stderr: expect.stringContaining('--crew') });
+  expect(JSON.parse((await cli(state, 'members', '--crew', 'other', '--json')).stdout).crew).toBe('other');
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const agentHeaders = { Authorization: `Bearer ${credential}`, 'X-Crew': 'other' };
+  const managed = await fetch(`${discovery.url}/members`, { headers: agentHeaders });
+  expect(await managed.json()).toMatchObject({ crew: 'sample', members: [{ seat: 'planner' }, { seat: 'coder' }, { seat: 'reviewer' }] });
+  expect((await fetch(`${discovery.url}/members?crew=other`, { headers: agentHeaders })).status).toBe(403);
+  expect((await fetch(`${discovery.url}/crews?crew=other`, { headers: agentHeaders })).status).toBe(403);
+  const scopedStatus = await fetch(`${discovery.url}/crews`, { headers: agentHeaders });
+  expect(await scopedStatus.json()).toMatchObject({ name: 'sample' });
+  const operatorHeaders = { Authorization: `Bearer ${discovery.token}` };
+  expect((await fetch(`${discovery.url}/members`, { headers: operatorHeaders })).status).toBe(409);
+  expect((await fetch(`${discovery.url}/members?crew=missing`, { headers: operatorHeaders })).status).toBe(404);
+  expect((await fetch(`${discovery.url}/members?crew=sample`, { headers: { Authorization: 'Bearer invented' } })).status).toBe(401);
+  const cliManaged = await exec(process.execPath, [cliPath, '--state-dir', state, 'members', '--json'], {
+    env: { ...process.env, CREW_EXECUTION_TOKEN: credential, CREW_NAME: 'other', CREW_SEAT: 'invented' }, timeout: 15000,
+  });
+  expect(JSON.parse(cliManaged.stdout).crew).toBe('sample');
+}, 30000);
+
+
+test.each([
+  ['role_file: reviewer.md', 'role_file: missing.md', 'role_file'],
+  ['role_file: reviewer.md', 'role_file: reviewer.md\n    cwd: missing', 'working directory'],
+  ['  reviewer:\n    runtime: claude', '  reviewer:\n    runtime: codex', 'configuration'],
+  ['  reviewer:', '  planner:', 'unique'],
+])('the entire crew is validated before any terminal is created (%s)', async (original, replacement, message) => {
+  const { state, config } = await multiFixture();
+  await writeFile(config, (await readFile(config, 'utf8')).replace(original, replacement));
+  await cli(state, 'daemon', 'start');
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const headers = { Authorization: `Bearer ${discovery.token}`, 'Content-Type': 'application/json' };
+  const response = await fetch(`${discovery.url}/crews/up`, { method: 'POST', headers, body: JSON.stringify({ configPath: config }) });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ error: expect.stringContaining(message) });
+  expect((await fetch(`${discovery.url}/crews/sample`, { headers })).status).toBe(404);
+  await expect(exec('tmux', ['-S', join(state, 'tmux.sock'), 'list-sessions'])).rejects.toThrow();
+}, 20000);
+
+test('partial launch failure cleans the failed seat while keeping registered teammates ready', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  const tmux = (await exec('which', ['tmux'])).stdout.trim();
+  const bin = join(directory, 'bin');
+  await mkdir(bin);
+  await writeFile(join(bin, 'tmux'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { readFileSync } = await import('node:fs');
+const args = process.argv.slice(2);
+const result = spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' });
+const coder = args.includes('new-session') && JSON.parse(readFileSync(args.at(-1), 'utf8')).env.CREW_SEAT === 'coder';
+process.exit(coder && result.status === 0 ? 12 : result.status ?? 1);
+`, { mode: 0o700 });
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
+  });
+  await expect(cli(state, 'up', config, '--json')).rejects.toMatchObject({ code: 1, stdout: expect.stringContaining('"status":"failed"') });
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const headers = { Authorization: `Bearer ${discovery.token}` };
+  await expect.poll(async () => (await (await fetch(`${discovery.url}/crews/sample`, { headers })).json()).seats.map((seat: { status: string }) => seat.status))
+    .toEqual(['ready', 'failed', 'ready']);
+  const status = await (await fetch(`${discovery.url}/crews/sample`, { headers })).json();
+  expect(status.status).toBe('failed');
+  expect(status.seats[1]).toMatchObject({ name: 'coder', failure: expect.stringContaining('Launch failed'), tmux: null });
+  const sessions = (await exec(tmux, ['-S', join(state, 'tmux.sock'), 'list-sessions', '-F', '#{session_name}'])).stdout.trim().split('\n');
+  expect(sessions.sort()).toEqual([status.seats[0].tmux.session, status.seats[2].tmux.session].sort());
+  const members = JSON.parse((await cli(state, 'members', '--crew', 'sample', '--json')).stdout);
+  expect(members.members.map((seat: { status: string }) => seat.status)).toEqual(['ready', 'failed', 'ready']);
+  await cli(state, 'daemon', 'stop');
+}, 25000);
+
+test('member roles preserve launch instructions even if the role source changes', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await writeFile(join(directory, 'planner.md'), 'Edited after launch.');
+  const roster = JSON.parse((await cli(state, 'members', '--json')).stdout);
+  expect(roster.members[0]).toMatchObject({ seat: 'planner', role: 'You are the planner. Perform only your assigned role.\n' });
+}, 20000);

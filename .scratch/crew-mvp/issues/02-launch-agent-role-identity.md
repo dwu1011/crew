@@ -4,7 +4,7 @@
 
 **Blocked by:** 01: Start and stop the local daemon (including manual acceptance).
 
-**Status:** awaiting-manual-validation
+**Status:** accepted-for-progression
 
 - [x] Crew startup reads YAML, resolves relative references against configuration location, and validates role sources and working directories before creating agent processes.
 - [x] Invalid configuration creates no agent process and reports actionable errors.
@@ -63,3 +63,5 @@ node dist/cli.js daemon stop
 ```
 
 Daemon shutdown leaves native terminals alone. Multi-seat launch, messaging, and lifecycle recovery are subsequent tickets. Manual checklist remains unchecked pending user validation; do not start ticket 3 yet.
+
+The user authorized ticket 3 with `$implement 3` after inspecting role guidance and the invalid-configuration results. Individual manual outcomes were not all supplied; the checklist above remains unchanged.
