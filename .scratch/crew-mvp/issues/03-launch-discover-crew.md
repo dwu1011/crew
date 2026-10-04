@@ -27,6 +27,8 @@ Supply runnable manual steps and expected outcomes after automated checks pass. 
 
 ## Manual handoff
 
+Automated verification: `bun run typecheck` passes; `bun run test` passes 26 tests with one opt-in native smoke check skipped. Standards and spec reviews against `83d8897` have no outstanding findings. Deterministic launch checks use a native-runtime substitute in real tmux; actual native multi-seat validation remains manual.
+
 Use a fresh state directory so an older daemon does not run the previous binary. From the crew repository:
 
 ```sh
