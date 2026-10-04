@@ -1390,7 +1390,7 @@ test.skipIf(process.env.CREW_NATIVE_MVP_SMOKE !== '1')('native crew messaging an
   await writeFile(join(directory, 'planner.md'), common + 'When the operator requests validation, send coder one request to inspect math.ts and reply via crew reply. When coder replies, acknowledge that reply and send one linked reply to the original operator request with your findings. Then stop.\n');
   await writeFile(join(directory, 'coder.md'), common + 'When planner requests inspection, read math.ts, reply to that message with findings, then send reviewer one request to review math.ts and reply via crew reply. Acknowledge reviewer reply and then stop.\n');
   await writeFile(join(directory, 'reviewer.md'), common + 'When coder requests review, read math.ts and send one linked reply to that request with findings. Then stop.\n');
-  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: process.env.CREW_NATIVE_BIN ?? 'claude' } });
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: process.env.CREW_NATIVE_BIN ?? 'claude', CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' } });
   await cli(state, 'up', config);
   let crew = JSON.parse((await cli(state, 'status', '--json')).stdout);
   for (const seat of crew.seats) {
@@ -1421,14 +1421,6 @@ test.skipIf(process.env.CREW_NATIVE_MVP_SMOKE !== '1')('native crew messaging an
   let conversation: any[] = [];
   await expect.poll(async () => {
     conversation = JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages;
-    for (const seat of crew.seats) {
-      const pending = conversation.some((message) => message.recipient.seat === seat.name && message.deliveries.some((attempt: { status: string }) => attempt.status === 'pending') && !message.acknowledgedAt);
-      if (!pending) continue;
-      const screen = (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout;
-      const tail = screen.split('\n').filter((line: string) => line.trim()).slice(-12).join('\n');
-      if (/-- INSERT --/.test(tail) && !/esc to interrupt|[✳✻✽✶].*…/.test(tail) && /^❯.+$/m.test(tail))
-        await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
-    }
     const coderReply = conversation.find((m) => m.sender.seat === 'coder' && m.recipient.seat === 'planner' && m.replyTo);
     const reviewRequest = conversation.find((m) => m.sender.seat === 'coder' && m.recipient.seat === 'reviewer');
     const reviewReply = conversation.find((m) => m.sender.seat === 'reviewer' && m.replyTo === reviewRequest?.id);
