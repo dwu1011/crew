@@ -384,3 +384,55 @@ test('member roles preserve launch instructions even if the role source changes'
   const roster = JSON.parse((await cli(state, 'members', '--json')).stdout);
   expect(roster.members[0]).toMatchObject({ seat: 'planner', role: 'You are the planner. Perform only your assigned role.\n' });
 }, 20000);
+
+
+test('attach and detach select named seats without stopping agents or disconnecting other seats', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const socket = before.seats[0].tmux.socket;
+  const outer = join(directory, 'outer.sock');
+  try {
+    for (const seat of ['planner', 'coder']) {
+      await exec('tmux', ['-f', '/dev/null', '-S', outer, 'new-session', '-d', '-s', seat,
+        '-x', '160', '-y', '40', process.execPath, cliPath, '--state-dir', state, 'attach', seat]);
+    }
+    await expect.poll(async () => (await exec('tmux', ['-S', socket, 'list-clients', '-F', '#{client_session}'])).stdout.trim().split('\n').sort())
+      .toEqual([before.seats[0].tmux.session, before.seats[1].tmux.session].sort());
+    const detached = await cli(state, 'detach', 'planner');
+    expect(detached.stdout).toContain('planner');
+    expect((await exec('tmux', ['-S', socket, 'list-clients', '-F', '#{client_session}'])).stdout.trim()).toBe(before.seats[1].tmux.session);
+    await cli(state, 'detach', 'coder');
+    expect((await exec('tmux', ['-S', socket, 'list-clients'])).stdout.trim()).toBe('');
+    const after = JSON.parse((await cli(state, 'status', '--json')).stdout);
+    expect(after.seats.map((seat: { executionId: string; status: string }) => ({ id: seat.executionId, status: seat.status })))
+      .toEqual(before.seats.map((seat: { executionId: string }) => ({ id: seat.executionId, status: 'ready' })));
+  } finally {
+    await exec('tmux', ['-S', outer, 'kill-server'], { timeout: 5000 }).catch(() => {});
+  }
+}, 25000);
+
+
+test('terminal commands report unknown seats, require interactive attachment, and demand explicit crew selection when ambiguous', async () => {
+  const { directory, state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect(cli(state, 'detach', 'missing')).rejects.toMatchObject({ stderr: expect.stringContaining('Available seats: investigator') });
+  await expect(cli(state, 'attach', 'investigator')).rejects.toMatchObject({ stderr: expect.stringContaining('interactive terminal') });
+  const other = join(directory, 'other.yaml');
+  await writeFile(other, (await readFile(config, 'utf8')).replace('name: sample', 'name: other'));
+  await cli(state, 'up', other, '--json');
+  await expect(cli(state, 'detach', 'investigator')).rejects.toMatchObject({ stderr: expect.stringContaining('--crew') });
+  await cli(state, 'detach', 'investigator', '--crew', 'sample');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'other', '--json')).stdout).status).toBe('ready');
+  const credential = await readFile(join(directory, 'credential-investigator'), 'utf8');
+  await expect(exec(process.execPath, [cliPath, '--state-dir', state, 'detach', 'investigator', '--crew', 'sample'], {
+    env: { ...process.env, CREW_EXECUTION_TOKEN: credential }, timeout: 15000,
+  })).rejects.toMatchObject({ stderr: expect.stringContaining('only inspect their own crew') });
+}, 20000);

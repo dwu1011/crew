@@ -14,6 +14,8 @@
 - [x] Unsupported runtimes and duplicate seat names are rejected during validation.
 - [x] CLI and direct HTTP tests cover crew scope, membership, multi-seat launch, and partial failures.
 
+- [x] User-requested terminal shortcuts: `crew attach <seat> [--crew <name>]` and `crew detach <seat> [--crew <name>]` resolve named seats without requiring tmux socket/session copying. Detach disconnects clients while preserving agents.
+
 ## Manual validation
 
 - [ ] Launch planner, coder, and reviewer seats; inspect each terminal and verify distinct identities and role guidance.
@@ -27,7 +29,7 @@ Supply runnable manual steps and expected outcomes after automated checks pass. 
 
 ## Manual handoff
 
-Automated verification: `bun run typecheck` passes; `bun run test` passes 26 tests with one opt-in native smoke check skipped. Standards and spec reviews against `83d8897` have no outstanding findings. Deterministic launch checks use a native-runtime substitute in real tmux; actual native multi-seat validation remains manual.
+Automated verification: `bun run typecheck` passes; `bun run test` passes 28 tests with one opt-in native smoke check skipped. Standards and spec reviews against `83d8897` have no outstanding findings. Deterministic launch checks use a native-runtime substitute in real tmux; actual native multi-seat validation remains manual.
 
 Use a fresh state directory so an older daemon does not run the previous binary. From the crew repository:
 
@@ -41,12 +43,21 @@ node dist/cli.js status --crew demo-crew --json
 
 Expected: planner, coder, and reviewer, each with distinct seat, execution, generation, native-session, and tmux-session identities. Members includes role text and execution status. `ready` means the native startup hook confirmed that execution, not that it is idle. Login/trust prompts may keep a seat launching until completed.
 
-Attach to each returned session using the returned socket and session name. For example:
+Enter seats by name from the crew repository:
 
 ```sh
-tmux -S "$CREW_HOME/tmux.sock" list-sessions
-tmux -S "$CREW_HOME/tmux.sock" attach-session -t "<actual-session-name>"
+bun run crew attach planner --crew demo-crew
+bun run crew attach coder --crew demo-crew
+bun run crew attach reviewer --crew demo-crew
 ```
+
+While attached, run the matching detach command from another shell with the same `CREW_HOME`, or ask the managed Claude agent to run `crew detach planner` (replace planner with its seat):
+
+```sh
+bun run crew detach planner --crew demo-crew
+```
+
+Detaching returns the attached client to its shell while keeping Claude alive. Attachment supports nesting inside Herdr/tmux; no copying of socket/session names is needed. With one crew, `--crew` can be omitted. Attachment requires an interactive terminal; detach can run from another shell. Detach disconnects all clients attached to that seat and leaves other seats' clients alone.
 
 Ask each native agent to run `crew whoami --json`, `crew members --json`, and `crew status --json`, then describe its own role and its teammates. Expect all three to report the same crew roster, each with its own identity and role. These commands derive crew selection from the managed credential. Asking a managed seat to run `crew members --crew different --json` must fail; naming another crew cannot change its scope. Inspect `contextFile` from status to see the initial role, roster, and coordination instructions. Messaging remains unimplemented.
 
