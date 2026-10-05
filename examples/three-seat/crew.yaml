@@ -1,0 +1,12 @@
+name: demo-crew
+project: ../..
+agents:
+  planner:
+    runtime: claude
+    role_file: planner.md
+  coder:
+    runtime: claude
+    role_file: coder.md
+  reviewer:
+    runtime: claude
+    role_file: reviewer.md

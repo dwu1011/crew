@@ -4,8 +4,10 @@ import { Hono } from 'hono';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { processAlive } from './state.js';
+import { Crews } from './crews.js';
+import { HTTPException } from 'hono/http-exception';
 
 process.umask(0o077);
 const directory = resolve(process.argv[2]);
@@ -48,6 +50,7 @@ try {
 
 const token = randomBytes(32).toString('hex');
 const app = new Hono();
+const crews = new Crews(db, directory);
 let stopping = false;
 let url = '';
 function status() {
@@ -62,6 +65,43 @@ function status() {
 }
 app.get('/health', (context) => context.json(status()));
 app.get('/status', (context) => context.json(status()));
+app.onError((error, context) => {
+  if (error instanceof HTTPException) return context.json({ error: error.message }, error.status);
+  if (error instanceof SyntaxError) return context.json({ error: 'Request must contain valid JSON' }, 400);
+  console.error(error);
+  return context.json({ error: 'Internal daemon error; inspect the daemon log' }, 500);
+});
+app.post('/crews/up', async (context) => {
+  if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const body = await context.req.json();
+  if (typeof body?.configPath !== 'string' || !isAbsolute(body.configPath)) return context.json({ error: 'configPath must be an absolute path' }, 400);
+  return context.json(await crews.launch(body.configPath));
+});
+app.get('/crews/:name', (context) => {
+  if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
+  return context.json(crews.status(context.req.param('name')));
+});
+const executionCredential = (header: string | undefined) => header?.startsWith('Bearer ') ? header.slice(7) : '';
+function selectedCrew(header: string | undefined, requested: string | undefined) {
+  if (header === `Bearer ${token}`) return crews.select(requested);
+  const caller = crews.whoami(executionCredential(header));
+  if (requested && requested !== caller.crew) throw new HTTPException(403, { message: 'Managed executions can only inspect their own crew' });
+  return caller.crew;
+}
+app.get('/crews', (context) => context.json(crews.status(selectedCrew(context.req.header('Authorization'), context.req.query('crew')))));
+app.get('/members', async (context) => context.json(await crews.members(selectedCrew(context.req.header('Authorization'), context.req.query('crew')))));
+app.get('/whoami', (context) => context.json(crews.whoami(executionCredential(context.req.header('Authorization')))));
+app.post('/executions/ready', async (context) => {
+  const body = await context.req.json();
+  if (typeof body?.sessionId !== 'string' || typeof body?.cwd !== 'string') return context.json({ error: 'sessionId and cwd are required' }, 400);
+  return context.json(crews.ready(executionCredential(context.req.header('Authorization')), body.sessionId, body.cwd));
+});
+app.post('/executions/exited', async (context) => {
+  const body = await context.req.json();
+  if (typeof body?.reason !== 'string') return context.json({ error: 'reason is required' }, 400);
+  return context.json(crews.exited(executionCredential(context.req.header('Authorization')), body.reason));
+});
 app.post('/shutdown', (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
   setImmediate(shutdown);
@@ -91,8 +131,9 @@ function shutdown() {
   stopping = true;
   const drainDeadline = setTimeout(() => server.closeAllConnections(), 1000);
   drainDeadline.unref();
-  server.close(() => {
+  server.close(async () => {
     clearTimeout(drainDeadline);
+    await crews.drain();
     db.prepare('UPDATE daemon_lifecycle SET pid = NULL, stopped_at = ? WHERE singleton = 1 AND boot_id = ?')
       .run(new Date().toISOString(), bootId);
     db.close();
