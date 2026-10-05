@@ -13,7 +13,7 @@ import { attachCrew, attachSession, detachCrew } from './terminal.js';
 const program = new Command().name('crew').description('Local agent crew coordinator')
   .option('--state-dir <directory>', 'Daemon state directory', process.env.CREW_HOME ?? join(homedir(), '.crew'));
 const daemon = program.command('daemon').description('Manage the local coordinator');
-program.command('send <seat>').description('Persist a message for a seat; terminal delivery is pending')
+program.command('send <seat>').description('Persist a message and queue terminal delivery')
   .option('--crew <name>', 'Crew name').option('--text <body>', 'Literal message body')
   .option('--body-file <path>', 'Read body from a file; - reads standard input')
   .option('--request-id <id>', 'Reuse this identifier to recover a submission').option('--json', 'Machine-readable output')

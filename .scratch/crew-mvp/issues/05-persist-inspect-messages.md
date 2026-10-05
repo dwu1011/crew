@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: Launch and discover a complete crew (including manual acceptance).
 
-**Status:** awaiting-manual-validation
+**Status:** completed
 
 - [x] Sending commits an immutable message and initial pending delivery attempt together before returning a stable message identifier.
 - [x] Sender attribution comes from the authorized execution or human operator; unknown recipients, cross-crew access, and arbitrary sender impersonation are rejected.
@@ -17,9 +17,9 @@
 
 ## Manual validation
 
-- [ ] Send messages from an agent and a human shell, then inspect their sender attribution and pending state.
-- [ ] Send multiline content containing quotes, Unicode, backticks, and shell-like text; verify exact stored content without executing that text.
-- [ ] Restart the daemon and verify history remains; repeat one request identity and confirm the original message is returned.
+- [x] Send messages from an agent and a human shell, then inspect their sender attribution and pending state.
+- [x] Send multiline content containing quotes, Unicode, backticks, and shell-like text; verify exact stored content without executing that text.
+- [x] Restart the daemon and verify history remains; repeat one request identity and confirm the original message is returned.
 
 ## Automated verification
 
@@ -28,15 +28,15 @@
 - Final `bun run test`: 45 passed, 1 opt-in native smoke test skipped. CLI and HTTP tests use a real daemon, SQLite, tmux, and controlled native executable fixtures.
 - Standards and spec reviews compared against ticket 4's final commit `3522427`: no remaining findings. The baseline question was asked; `3522427` was used as the natural comparison point while the reply was pending.
 - Ticket 4 PR: https://github.com/dwu1011/crew/pull/4, stacked on PR 3.
-- No terminal submission, acknowledgment, or reply behavior is implemented by this slice. Ticket 6 has not started; manual validation remains pending.
+- No terminal submission, acknowledgment, or reply behavior is implemented by this slice. The user delegated the full native validation procedure, then approved PR creation and progression to ticket 6 on 2026-10-04.
 
 ## Completion gate
 
-Provide the exact manual procedure after automated checks pass. Stop for user sign-off before beginning another ticket. No manual acceptance has been recorded.
+Provide the exact manual procedure after automated checks pass. Stop for user sign-off before beginning another ticket. Assisted native validation passed; the user approved progression on 2026-10-04. Evidence: `/private/tmp/crew-validation-5-zrdotf/validation-summary.json`. PR: https://github.com/dwu1011/crew/pull/5.
 
 ## Manual handoff
 
-Run from the crew repository in the same shell. Fresh state gives the agents the updated coordination instructions.
+Historical ticket-5 procedure; its expected pending-only behavior applies to the ticket-5 branch. Ticket 6 adds terminal delivery. Run from the crew repository in the same shell. Fresh state gives the agents the updated coordination instructions.
 
 ```sh
 bun run build
@@ -101,4 +101,4 @@ bun run crew inbox --crew demo-crew --all --json
 bun run crew daemon stop
 ```
 
-Expected: stdin preserves the exact body. Sending to a stopped seat succeeds with pending delivery. History survives; no submission or receipt is claimed. Cleanup stops the crew and daemon. Manual acceptance is pending; do not start ticket 6 yet.
+Expected: stdin preserves the exact body. Sending to a stopped seat succeeds with pending delivery. History survives; no submission or receipt is claimed. Cleanup stops the crew and daemon. Assisted validation completed and progression to ticket 6 was approved.

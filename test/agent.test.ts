@@ -9,7 +9,7 @@ const exec = promisify(execFile);
 const cliPath = resolve('dist/cli.js');
 const fixtures: { directory: string; state: string }[] = [];
 
-async function fixture(mode: 'normal' | 'hold' | 'exit' | 'discovery' = 'normal') {
+async function fixture(mode: 'normal' | 'hold' | 'exit' | 'discovery' | 'delivery' | 'delivery-slow' = 'normal') {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'crew-seat-')));
   const state = join(directory, 'state');
   const project = join(directory, 'project with spaces');
@@ -23,7 +23,7 @@ async function fixture(mode: 'normal' | 'hold' | 'exit' | 'discovery' = 'normal'
   await writeFile(binary, `#!${process.execPath}
 import { readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-if (process.argv.includes('--version')) { console.log('2.1.283 (Claude Code fixture)'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log(${JSON.stringify(mode)}.startsWith('delivery') ? '2.1.289 (Claude Code fixture)' : '2.1.283 (Claude Code fixture)'); process.exit(0); }
 const args = process.argv.slice(2);
 const option = (name) => args[args.indexOf(name) + 1];
 const prompt = readFileSync(option('--append-system-prompt-file'), 'utf8');
@@ -44,6 +44,49 @@ if (${JSON.stringify(mode)} === 'discovery') {
   console.log('CREW_MEMBERS=' + members.stdout.trim());
   if (members.status !== 0) { console.error(members.stderr); process.exit(1); }
 }
+if (${JSON.stringify(mode)}.startsWith('delivery')) {
+  const render = (visible = '', footer = '-- INSERT -- ⏵⏵ auto mode on') => { writeFileSync(${JSON.stringify(join(directory, 'current-draft.txt'))}, draft); process.stdout.write('\\x1b[2J\\x1b[HClaude Code v2.1.289\\n────────────────────────────────────────\\n❯ ' + visible.replaceAll('\\n', '\\n  ') + '\\n────────────────────────────────────────\\n  Model: Opus 5.5 | Thinking: medium\\n  Context: [░░░░]\\n  ' + footer + '\\x1b[3;3H\\x1b[?2004h'); };
+  process.stdin.setRawMode(true);
+  let draft = '', pasting = false, paste = '', collapsed = false, received = [];
+  render();
+  process.stdin.on('data', chunk => {
+    let text = chunk.toString();
+    if (text.includes('\\x1b[200~')) { pasting = true; paste = ''; text = text.replace('\\x1b[200~', ''); }
+    const endPaste = text.includes('\\x1b[201~');
+    text = text.replace('\\x1b[201~', '');
+    if (text === '\\x15') { draft = ''; collapsed = false; render(); return; }
+    if (text === '\\x10') { process.stdout.write('\\x1b[2J\\x1b[HDo you want to proceed?\\n❯ 1. Allow once\\nEsc to cancel'); return; }
+    if (text === '\\x13') { process.stdout.write('\\x1b[2J\\x1b[HChoose option\\n❯ 1. Allow once\\nEsc to cancel'); return; }
+    if (text === '\\x02') { render('', 'esc to interrupt'); return; }
+    if (text === '\\x12') { process.stdout.write('\\x1b[2J\\x1b[HUnrecognized native screen'); return; }
+    if (!pasting && text.includes('\\r')) {
+      received.push(draft + text.replaceAll('\\r', ''));
+      writeFileSync(${JSON.stringify(join(directory, 'received.json'))}, JSON.stringify(received));
+      draft = ''; render(); return;
+    }
+    if (pasting) paste += text; else draft += text;
+    if (endPaste) {
+      pasting = false;
+      if (${JSON.stringify(mode)} === 'delivery-slow' && collapsed) {
+        if (paste !== draft) draft += paste;
+        collapsed = false; render(draft); return;
+      }
+      draft += paste;
+      if (${JSON.stringify(mode)} === 'delivery-slow') {
+        collapsed = true;
+        process.stdout.write('\\x1b[2J\\x1b[HRendering paste...');
+        setTimeout(() => { if (collapsed) render('[Pasted text #1 +6 lines]', 'paste again to expand'); }, 650);
+        return;
+      }
+    }
+    if (${JSON.stringify(mode)} === 'delivery-slow') {
+      process.stdout.write('\\x1b[2J\\x1b[HRendering input...');
+      setTimeout(() => { if (!collapsed) render(draft); }, 650);
+      return;
+    }
+    render(draft);
+  });
+}
 process.stdin.resume();
 }
 `);
@@ -53,6 +96,55 @@ process.stdin.resume();
 
 async function cli(state: string, ...args: string[]) {
   return exec(process.execPath, [cliPath, '--state-dir', state, ...args], { timeout: 15000 });
+}
+
+async function deliveryFault(phase: 'load' | 'paste' | 'target' | 'enter' | 'draft' | 'collapsed') {
+  const item = await fixture(phase === 'collapsed' ? 'delivery-slow' : 'delivery');
+  const tmux = (await exec('which', ['tmux'])).stdout.trim();
+  const bin = join(item.directory, 'fault-bin');
+  const marker = join(item.directory, 'input-attempt');
+  const release = join(item.directory, 'release-input');
+  await mkdir(bin);
+  await writeFile(join(bin, 'tmux'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { writeFileSync, existsSync } = await import('node:fs');
+const args = process.argv.slice(2), phase = ${JSON.stringify(phase)};
+const run = (argv) => spawnSync(${JSON.stringify(tmux)}, argv, { stdio: 'inherit' });
+const replace = (socket) => {
+  const session = spawnSync(${JSON.stringify(tmux)}, ['-S', socket, 'list-sessions', '-F', '#{session_name}'], { encoding: 'utf8' }).stdout.trim();
+  run(['-S', socket, 'kill-session', '-t', '=' + session]);
+  run(['-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', session, 'sleep', '60']);
+};
+if (phase === 'load' && args.includes('load-buffer')) process.exit(13);
+if (phase === 'paste' && args.includes('if-shell') && args.some(arg => arg.includes('paste-buffer'))) {
+  writeFileSync(${JSON.stringify(marker)}, 'submitting');
+  const deadline = Date.now() + 1500;
+  while (!existsSync(${JSON.stringify(release)}) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  run(args); process.exit(14);
+}
+if (phase === 'enter' && args.includes('if-shell') && args.some(arg => arg.includes('send-keys'))) replace(args[args.indexOf('-S') + 1]);
+const result = run(args);
+if (phase === 'collapsed' && args.includes('if-shell') && args.some(arg => arg.includes('paste-buffer')) && !existsSync(${JSON.stringify(marker)})) {
+  writeFileSync(${JSON.stringify(marker)}, 'replaced');
+  const socket = args[args.indexOf('-S') + 1], pane = args[args.indexOf('-t') + 1];
+  run(['-S', socket, 'send-keys', '-t', pane, 'C-u']);
+  writeFileSync(${JSON.stringify(join(item.directory, 'foreign.txt'))}, 'HUMAN_REPLACEMENT\\nsecond line\\nthird line\\nfourth line');
+  run(['-S', socket, 'load-buffer', '-b', 'foreign', ${JSON.stringify(join(item.directory, 'foreign.txt'))}]);
+  run(['-S', socket, 'paste-buffer', '-t', pane, '-b', 'foreign', '-r', '-p']);
+}
+
+if (phase === 'draft' && args.includes('if-shell') && args.some(arg => arg.includes('paste-buffer')))
+  run(['-S', args[args.indexOf('-S') + 1], 'send-keys', '-t', args[args.indexOf('-t') + 1], '-l', 'USER_EXTRA']);
+if (phase === 'target' && args.includes('load-buffer')) {
+  const socket = args[args.indexOf('-S') + 1];
+  replace(socket);
+}
+process.exit(result.status ?? 1);
+`, { mode: 0o700 });
+  await exec(process.execPath, [cliPath, '--state-dir', item.state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: item.binary, PATH: `${bin}:${process.env.PATH}` }, timeout: 15000,
+  });
+  return { ...item, marker, release };
 }
 
 afterEach(async () => {
@@ -580,6 +672,8 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
   });
   await cli(state, 'up', config, '--json');
   await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const managed = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0].tmux;
+  await expect.poll(async () => (await exec('tmux', ['-S', managed.socket, 'capture-pane', '-p', '-J', '-t', managed.pane])).stdout).toContain('CREW_IDENTITY=');
   const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
   const headers = { Authorization: `Bearer ${discovery.token}` };
   const shutdown = fetch(`${discovery.url}/crews/down`, { method: 'POST', headers, body: JSON.stringify({ crew: 'sample' }) });
@@ -591,7 +685,8 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
     await exec('tmux', ['-S', during.seats[0].tmux.socket, 'has-session', '-t', during.seats[0].tmux.session]);
   } finally {
     await writeFile(release, 'release');
-    expect(await (await shutdown).json()).toMatchObject({ status: 'stopped' });
+    const response = await shutdown;
+    expect(await response.json(), response.ok ? undefined : await readFile(join(state, 'daemon.log'), 'utf8')).toMatchObject({ status: 'stopped' });
   }
 }, 25000);
 
@@ -755,16 +850,17 @@ test('submission retries recover the original message across restart and reject 
   await first.body!.cancel();
   const recovered = await (await submit()).json();
   expect(recovered).toMatchObject({ body: 'Recover this request.', deliveries: [{ status: 'pending' }] });
+  const stable = { ...recovered, deliveries: [expect.objectContaining({ id: recovered.deliveries[0].id, status: 'pending', executionId: null })] };
   const concurrent = await Promise.all([submit(), submit()]);
-  for (const response of concurrent) expect(await response.json()).toEqual(recovered);
+  for (const response of concurrent) expect(await response.json()).toEqual(stable);
   await cli(state, 'daemon', 'stop');
   await cli(state, 'daemon', 'start');
   discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
-  expect(await (await submit()).json()).toEqual(recovered);
+  expect(await (await submit()).json()).toEqual(stable);
   const conflict = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` },
     body: JSON.stringify({ recipient: 'investigator', body: 'Changed contents.', requestId: 'lost-response' }) });
   expect(conflict.status).toBe(409);
-  expect(JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages).toEqual([recovered]);
+  expect(JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages).toEqual([stable]);
   expect(JSON.parse((await cli(state, 'message', 'show', recovered.id, '--json')).stdout).acknowledgedAt).toBeNull();
 }, 20000);
 
@@ -848,6 +944,159 @@ test('operator messaging requires unambiguous crew selection and validates the H
     expect(response.status).toBe(400);
   }
   expect(JSON.parse((await cli(state, 'inbox', '--crew', 'sample', '--json')).stdout).messages).toEqual([sent]);
+}, 20000);
+
+test.each(['delivery', 'delivery-slow'] as const)('a full literal message is submitted to the verified ready terminal without acknowledgment (%s)', async (mode) => {
+  const { directory, state, config, binary } = await fixture(mode);
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  const body = "Line one: café 雪\nLine two: 'quotes' \"double\" `echo literal` $(echo literal)\nDo you want to proceed? esc to interrupt\n";
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', body, '--json')).stdout);
+  expect(sent.deliveries[0].status).toBe('pending');
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0],
+    { timeout: 12000 }).toMatchObject({ status: 'submitted' });
+  const observed = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
+  expect(observed).toMatchObject({ acknowledgedAt: null, deliveries: [{ executionId: seat.executionId, generation: seat.generation, pane: seat.tmux.pane, status: 'submitted' }] });
+  await expect.poll(() => readFile(join(directory, 'received.json'), 'utf8').catch(() => ''), { timeout: 5000 }).not.toBe('');
+  const received = JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'));
+  expect(received).toHaveLength(1);
+  expect(received[0]).toContain(sent.id);
+  expect(received[0]).toContain('Sender: operator');
+  expect(received[0]).toContain('Recipient: investigator');
+  expect(received[0]).toContain(body);
+  expect(received[0]).toContain('Reply guidance:');
+}, 20000);
+
+test.each([
+  ['existing draft', 'My existing draft', 'draft'],
+  ['permission dialog', '\u0010', 'Unrecognized'],
+  ['selection menu', '\u0013', 'Unrecognized'],
+  ['busy turn', '\u0002', 'busy'],
+  ['unknown screen', '\u0012', 'Unrecognized'],
+])('delivery defers for %s and resumes after a verified empty prompt', async (_name, input, reason) => {
+  const { directory, state, config, binary } = await fixture('delivery');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, '-l', input]);
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Wait until input is safe.', '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0], { timeout: 8000 })
+    .toMatchObject({ status: 'pending', failure: expect.stringContaining(reason) });
+  await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  if (input === 'My existing draft') expect((await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout).toContain(input);
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status, { timeout: 8000 }).toBe('submitted');
+  const received = JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'));
+  expect(received).toHaveLength(1);
+  expect(received[0]).toContain(sent.id);
+}, 20000);
+
+test('messages to one seat are submitted as distinct serialized envelopes', async () => {
+  const { directory, state, config, binary } = await fixture('delivery');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const messages = await Promise.all(['First body.\n雪', 'Second body.\nCafé'].map(async (body, index) => {
+    const response = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` },
+      body: JSON.stringify({ recipient: 'investigator', body, requestId: `serialized-${index}` }) });
+    expect(response.status).toBe(200);
+    return response.json();
+  }));
+  await expect.poll(async () => JSON.parse(await readFile(join(directory, 'received.json'), 'utf8').catch(() => '[]')).length,
+    { timeout: 10000 }).toBe(2);
+  const received = JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'));
+  for (const message of messages) {
+    const envelope = received.find((text: string) => text.includes(message.id));
+    expect(envelope).toContain(message.body);
+    expect(envelope).not.toContain(messages.find((other) => other.id !== message.id).id);
+    expect(JSON.parse((await cli(state, 'message', 'show', message.id, '--json')).stdout).deliveries).toHaveLength(1);
+  }
+}, 20000);
+
+test('failure before terminal input is definite and is not automatically retried', async () => {
+  const { directory, state, config } = await deliveryFault('load');
+  await cli(state, 'up', config);
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Do not retry a definite failure.', '--request-id', 'failed-input', '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status,
+    { timeout: 8000 }).toBe('failed');
+  await cli(state, 'send', 'investigator', '--text', 'Do not retry a definite failure.', '--request-id', 'failed-input');
+  const shown = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
+  expect(shown.deliveries).toHaveLength(1);
+  expect(shown.deliveries[0].status).toBe('failed');
+  await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+}, 20000);
+
+test('submitting precedes paste and an ambiguous paste failure stays uncertain', async () => {
+  const { directory, state, config, marker, release } = await deliveryFault('paste');
+  await cli(state, 'up', config);
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Paste uncertainty.', '--request-id', 'uncertain-input', '--json')).stdout);
+  try {
+    await expect.poll(() => readFile(marker, 'utf8').catch(() => ''), { timeout: 8000 }).toBe('submitting');
+    expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status).toBe('submitting');
+  } finally { await writeFile(release, 'release'); }
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status,
+    { timeout: 8000 }).toBe('uncertain');
+  const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  expect((await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-J', '-t', seat.tmux.pane])).stdout).toContain(sent.id);
+  await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, 'C-u']);
+  await cli(state, 'send', 'investigator', '--text', 'Paste uncertainty.', '--request-id', 'uncertain-input');
+  expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries).toMatchObject([{ status: 'uncertain' }]);
+  await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+}, 20000);
+
+test('a terminal replaced after preparation receives no stale message input', async () => {
+  const { state, config } = await deliveryFault('target');
+  await cli(state, 'up', config);
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Never write to a replacement terminal.', '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0],
+    { timeout: 8000 }).toMatchObject({ status: 'failed', failure: expect.stringContaining('target changed') });
+  const socket = join(state, 'tmux.sock');
+  expect((await exec('tmux', ['-S', socket, 'capture-pane', '-p', '-t', '%0'])).stdout).not.toContain(sent.id);
+  expect((await exec('tmux', ['-S', socket, 'list-panes', '-a', '-F', '#{pane_current_command}'])).stdout.trim()).toBe('sleep');
+}, 20000);
+
+test.each(['enter', 'draft', 'collapsed'] as const)('delivery refuses Enter after a post-paste %s change', async (phase) => {
+  const { directory, state, config } = await deliveryFault(phase);
+  await cli(state, 'up', config);
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Verify again before Enter.', '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status,
+    { timeout: 8000 }).toBe('uncertain');
+  await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  const capture = (await exec('tmux', ['-S', join(state, 'tmux.sock'), 'capture-pane', '-p', '-J', '-t', '%0'])).stdout;
+  if (phase === 'enter') expect(capture).not.toContain(sent.id);
+  else expect(capture).toContain(phase === 'collapsed' ? '[Pasted text #1' : 'USER_EXTRA');
+  if (phase === 'collapsed') expect(await readFile(join(directory, 'current-draft.txt'), 'utf8')).toBe('HUMAN_REPLACEMENT\nsecond line\nthird line\nfourth line');
+}, 20000);
+
+test('unsupported terminal versions remain pending and unsafe control bytes are never injected', async () => {
+  const unsupported = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', unsupported.state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: unsupported.binary }, timeout: 15000,
+  });
+  await cli(unsupported.state, 'up', unsupported.config);
+  const held = JSON.parse((await cli(unsupported.state, 'send', 'investigator', '--text', 'Unsupported input profile.', '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(unsupported.state, 'message', 'show', held.id, '--json')).stdout).deliveries[0], { timeout: 8000 })
+    .toMatchObject({ status: 'pending', failure: expect.stringContaining('Unsupported') });
+  const supported = await fixture('delivery');
+  await exec(process.execPath, [cliPath, '--state-dir', supported.state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: supported.binary }, timeout: 15000,
+  });
+  await cli(supported.state, 'up', supported.config);
+  const file = join(supported.directory, 'unsafe-body.txt');
+  await writeFile(file, 'Literal escape: \u001b[201~');
+  const failed = JSON.parse((await cli(supported.state, 'send', 'investigator', '--body-file', file, '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(supported.state, 'message', 'show', failed.id, '--json')).stdout).deliveries[0], { timeout: 8000 })
+    .toMatchObject({ status: 'failed', failure: expect.stringContaining('control characters'), submittingAt: null });
+  await expect(readFile(join(supported.directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
 }, 20000);
 
 test('missing executions require an explicit crew shutdown before a fresh launch', async () => {
