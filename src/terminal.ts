@@ -14,8 +14,13 @@ function requireTerminal() {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('crew attach requires an interactive terminal.');
 }
 
+export async function prepareAgentTerminal(socket: string, session: string) {
+  await exec('tmux', ['-S', socket, 'set-window-option', '-t', `=${session}:0`, 'window-size', 'latest'], { timeout: 5000 });
+}
+
 export async function attachSession(socket: string, session: string) {
   requireTerminal();
+  await prepareAgentTerminal(socket, session);
   const env = { ...process.env };
   delete env.TMUX;
   delete env.TMUX_PANE;
@@ -41,6 +46,7 @@ export async function attachCrew(directory: string, crew: Crew) {
   try {
     for (const [index, seat] of seats.entries()) {
       const terminal = seat.tmux!;
+      await prepareAgentTerminal(terminal.socket, terminal.session);
       const command = ['env', '-u', 'TMUX', '-u', 'TMUX_PANE', 'tmux', '-S', terminal.socket, 'attach-session', '-t', `=${terminal.session}`];
       const args = index === 0
         ? ['-f', '/dev/null', 'new-session', '-d', '-s', session, '-x', '160', '-y', '40']
