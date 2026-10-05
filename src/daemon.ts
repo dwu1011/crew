@@ -87,7 +87,8 @@ app.post('/crews/up', async (context) => {
 });
 app.get('/crews/:name', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
-  return context.json(await crews.status(context.req.param('name')));
+  const caller = { crew: context.req.param('name'), seatId: null, executionId: null };
+  return context.json({ ...await crews.status(caller.crew), deliveryIssues: messages.issues(caller) });
 });
 const executionCredential = (header: string | undefined) => header?.startsWith('Bearer ') ? header.slice(7) : '';
 function selectedCaller(header: string | undefined, requested: string | undefined) {
@@ -96,7 +97,10 @@ function selectedCaller(header: string | undefined, requested: string | undefine
   if (requested && requested !== caller.crew) throw new HTTPException(403, { message: 'Managed executions can only inspect their own crew' });
   return { crew: caller.crew, seatId: caller.seatId, executionId: caller.executionId };
 }
-app.get('/crews', async (context) => context.json(await crews.status(selectedCaller(context.req.header('Authorization'), context.req.query('crew')).crew)));
+app.get('/crews', async (context) => {
+  const caller = selectedCaller(context.req.header('Authorization'), context.req.query('crew'));
+  return context.json({ ...await crews.status(caller.crew), deliveryIssues: messages.issues(caller) });
+});
 app.post('/crews/down', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
@@ -113,6 +117,12 @@ app.post('/messages', async (context) => {
   const body = parsed.data;
   const message = messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId);
   return context.json(message);
+});
+app.post('/messages/:id/retry', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ crew: z.string().min(1).optional(), allowDuplicate: z.boolean().default(false) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected boolean allowDuplicate and optional crew only' }, 400);
+  return context.json(messages.retry(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.allowDuplicate));
 });
 app.post('/messages/:id/reply', async (context) => {
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);

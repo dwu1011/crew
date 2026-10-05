@@ -29,6 +29,7 @@ export class Delivery {
   }
 
   start() {
+    this.db.prepare("UPDATE delivery_attempts SET status = 'uncertain', failure = 'Daemon restarted during terminal submission; input may have occurred' WHERE status = 'submitting'").run();
     this.timer = setInterval(() => this.tick(), 400);
     this.timer.unref();
     this.tick();
@@ -44,7 +45,7 @@ export class Delivery {
     if (this.stopping) return;
     const pending = this.db.prepare(`SELECT a.id, m.id AS message_id, m.recipient_seat_id, m.body, recipient.name AS recipient, sender.name AS sender
       FROM delivery_attempts a JOIN messages m ON m.id = a.message_id JOIN seats recipient ON recipient.id = m.recipient_seat_id
-      LEFT JOIN seats sender ON sender.id = m.sender_seat_id WHERE a.status = 'pending' ORDER BY m.rowid, a.rowid`).all() as Pending[];
+      LEFT JOIN seats sender ON sender.id = m.sender_seat_id WHERE a.status = 'pending' AND m.acknowledged_at IS NULL ORDER BY m.rowid, a.rowid`).all() as Pending[];
     for (const attempt of pending) {
       if (this.jobs.has(attempt.recipient_seat_id)) continue;
       const task = this.crews.withRecipient(attempt.recipient_seat_id, () => this.deliver(attempt))
@@ -56,6 +57,7 @@ export class Delivery {
   }
 
   private async deliver(attempt: Pending) {
+    if (!this.db.prepare("SELECT a.id FROM delivery_attempts a JOIN messages m ON m.id = a.message_id WHERE a.id = ? AND a.status = 'pending' AND m.acknowledged_at IS NULL").get(attempt.id)) return;
     const tmux = (args: string[]) => exec('tmux', ['-S', this.crews.socket, ...args], { timeout: 2000 });
     const defer = (reason: string) => this.db.prepare("UPDATE delivery_attempts SET failure = ? WHERE id = ? AND status = 'pending'").run(reason, attempt.id);
     const resolved = await this.crews.deliveryTarget(attempt.recipient_seat_id);
@@ -78,8 +80,9 @@ export class Delivery {
       if (!verified.target || verified.target.executionId !== target.executionId || verified.target.generation !== target.generation
         || verified.target.pane !== target.pane || !this.crews.currentTarget(target)) { defer('Recipient target changed before input; waiting for verified execution'); return; }
       if (this.stopping || ready.state !== 'empty') { defer(this.stopping ? 'Daemon is stopping' : ready.reason!); return; }
-      this.db.prepare("UPDATE delivery_attempts SET status = 'submitting', execution_id = ?, generation = ?, pane = ?, submitting_at = ?, failure = NULL WHERE id = ? AND status = 'pending'")
+      const submitting = this.db.prepare("UPDATE delivery_attempts SET status = 'submitting', execution_id = ?, generation = ?, pane = ?, submitting_at = ?, failure = NULL WHERE id = ? AND status = 'pending' AND EXISTS (SELECT 1 FROM messages WHERE messages.id = delivery_attempts.message_id AND acknowledged_at IS NULL)")
         .run(target.executionId, target.generation, target.pane, new Date().toISOString(), attempt.id);
+      if (submitting.changes !== 1) return;
       inputAttempted = true;
       const condition = (frame: { x: number; y: number }) => [
         ['pane_pid', target.runnerPid], ['session_name', target.session], ['cursor_x', frame.x], ['cursor_y', frame.y], ['pane_in_mode', 0], ['pane_input_off', 0],

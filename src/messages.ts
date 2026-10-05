@@ -65,6 +65,11 @@ export class Messages {
         }).immediate();
       } finally { db.pragma('foreign_keys = ON'); }
     }
+    db.transaction(() => {
+      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('009_delivery_retry')) return;
+      db.exec("CREATE UNIQUE INDEX delivery_one_active ON delivery_attempts(message_id) WHERE status IN ('pending', 'submitting')");
+      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('009_delivery_retry', new Date().toISOString());
+    }).immediate();
   }
 
   private crew(caller: MessageCaller) {
@@ -133,6 +138,30 @@ export class Messages {
         .map((attempt) => ({ id: attempt.id, executionId: attempt.execution_id, generation: attempt.generation, pane: attempt.pane, status: attempt.status, createdAt: attempt.created_at,
           submittingAt: attempt.submitting_at, submittedAt: attempt.submitted_at, failure: attempt.failure })),
     };
+  }
+
+  retry(caller: MessageCaller, id: string, allowDuplicate: boolean) {
+    this.db.transaction(() => {
+      const message = this.show(caller, id);
+      if (message.acknowledgedAt) throw new HTTPException(409, { message: 'Acknowledged messages cannot be retried' });
+      if (!message.recipient.seatId) throw new HTTPException(409, { message: 'Operator replies have no terminal delivery to retry' });
+      const latest = message.deliveries.at(-1);
+      if (!latest || !['failed', 'uncertain'].includes(latest.status))
+        throw new HTTPException(409, { message: 'Only a definite failure or uncertain delivery can be retried' });
+      if (latest.status === 'uncertain' && !allowDuplicate)
+        throw new HTTPException(409, { message: 'Uncertain delivery may already have occurred; retry requires --allow-duplicate' });
+      this.db.prepare("INSERT INTO delivery_attempts (id, message_id, status, created_at) VALUES (?, ?, 'pending', ?)")
+        .run(randomUUID(), id, new Date().toISOString());
+    }).immediate();
+    return this.show(caller, id);
+  }
+
+  issues(caller: MessageCaller) {
+    const rows = this.db.prepare(`SELECT m.id FROM messages m JOIN delivery_attempts a ON a.message_id = m.id
+      WHERE m.crew_id = ? AND m.acknowledged_at IS NULL AND (? IS NULL OR m.sender_seat_id = ? OR m.recipient_seat_id = ?)
+      AND a.rowid = (SELECT MAX(rowid) FROM delivery_attempts WHERE message_id = m.id)
+      AND a.status IN ('failed', 'uncertain') ORDER BY m.rowid`).all(this.crew(caller), caller.seatId, caller.seatId, caller.seatId) as { id: string }[];
+    return rows.map((row) => this.show(caller, row.id));
   }
 
   inbox(caller: MessageCaller, all: boolean) {
