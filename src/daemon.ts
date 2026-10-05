@@ -140,6 +140,24 @@ app.post('/messages/:id/ack', async (context) => {
 app.get('/messages/:id', (context) => context.json(messages.show(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.param('id'))));
 app.get('/inbox', (context) => context.json(messages.inbox(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.query('all') === 'true')));
 app.get('/whoami', (context) => context.json(crews.whoami(executionCredential(context.req.header('Authorization')))));
+app.post('/executions/activity', async (context) => {
+  const caller = crews.whoami(executionCredential(context.req.header('Authorization')));
+  const parsed = z.object({ event: z.enum(['SessionStart', 'UserPromptSubmit', 'Stop', 'PermissionRequest', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure']), eventAt: z.string().datetime(), sessionId: z.string(), cwd: z.string(), toolName: z.string().optional() }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected native activity event, timestamp, session, and cwd' }, 400);
+  if (caller.nativeSessionId !== parsed.data.sessionId || caller.cwd !== parsed.data.cwd) return context.json({ error: 'Native activity identity mismatch' }, 403);
+  if (Date.parse(parsed.data.eventAt) > Date.now() + 10000) return context.json({ error: 'Native event timestamp is in the future' }, 400);
+  return context.json(crews.recordActivity(caller.executionId, parsed.data.event, parsed.data.eventAt, parsed.data.toolName));
+});
+app.post('/executions/prompt', async (context) => {
+  const caller = crews.whoami(executionCredential(context.req.header('Authorization')));
+  const parsed = z.object({ attemptId: z.string().uuid(), sessionId: z.string(), cwd: z.string(), prompt: z.string(), nativePromptId: z.string().min(1).max(200).optional(), eventAt: z.string().datetime().optional() }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected delivery attempt, native session, cwd, and submitted prompt' }, 400);
+  if (caller.nativeSessionId !== parsed.data.sessionId || caller.cwd !== parsed.data.cwd) return context.json({ error: 'Native prompt identity mismatch' }, 403);
+  if (parsed.data.eventAt && Date.parse(parsed.data.eventAt) > Date.now() + 10000) return context.json({ error: 'Native event timestamp is in the future' }, 400);
+  const result = delivery.verifyPrompt(caller, parsed.data);
+  if ('firstReceipt' in result && result.firstReceipt) crews.recordActivity(caller.executionId, 'UserPromptSubmit', parsed.data.eventAt ?? new Date().toISOString());
+  return context.json(result);
+});
 app.post('/executions/ready', async (context) => {
   const body = await context.req.json();
   if (typeof body?.sessionId !== 'string' || typeof body?.cwd !== 'string') return context.json({ error: 'sessionId and cwd are required' }, 400);

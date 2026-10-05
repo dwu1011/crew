@@ -133,10 +133,11 @@ export class Messages {
       recipient: { kind: row.recipient_seat_id ? 'agent' : 'operator', seat: row.recipient, seatId: row.recipient_seat_id }, body: row.body, createdAt: row.created_at, acknowledgedAt: row.acknowledged_at,
       replyTo: row.reply_to, replies: this.db.prepare('SELECT id, created_at AS createdAt FROM messages WHERE reply_to = ? ORDER BY rowid').all(id),
       acknowledgment: row.acknowledged_at ? { executionId: row.acknowledged_execution_id, acknowledgedAt: row.acknowledged_at } : null,
-      deliveries: (this.db.prepare('SELECT id, execution_id, generation, pane, status, created_at, submitting_at, submitted_at, failure FROM delivery_attempts WHERE message_id = ? ORDER BY rowid').all(id) as
-        { id: string; execution_id: string | null; generation: string | null; pane: string | null; status: string; created_at: string; submitting_at: string | null; submitted_at: string | null; failure: string | null }[])
+      deliveries: (this.db.prepare('SELECT id, execution_id, generation, pane, status, created_at, submitting_at, submitted_at, failure, prompt_verified_at, prompt_hash, native_prompt_id FROM delivery_attempts WHERE message_id = ? ORDER BY rowid').all(id) as
+        { id: string; execution_id: string | null; generation: string | null; pane: string | null; status: string; created_at: string; submitting_at: string | null; submitted_at: string | null; failure: string | null; prompt_verified_at: string | null; prompt_hash: string | null; native_prompt_id: string | null }[])
         .map((attempt) => ({ id: attempt.id, executionId: attempt.execution_id, generation: attempt.generation, pane: attempt.pane, status: attempt.status, createdAt: attempt.created_at,
-          submittingAt: attempt.submitting_at, submittedAt: attempt.submitted_at, failure: attempt.failure })),
+          submittingAt: attempt.submitting_at, submittedAt: attempt.submitted_at, failure: attempt.failure,
+          promptVerification: attempt.prompt_verified_at ? { verifiedAt: attempt.prompt_verified_at, executionId: attempt.execution_id, nativePromptId: attempt.native_prompt_id, hash: attempt.prompt_hash } : null })),
     };
   }
 
