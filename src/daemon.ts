@@ -8,6 +8,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { processAlive } from './state.js';
 import { Crews } from './crews.js';
 import { Messages } from './messages.js';
+import { Delivery } from './delivery.js';
 import { z } from 'zod';
 import { HTTPException } from 'hono/http-exception';
 
@@ -54,7 +55,9 @@ const token = randomBytes(32).toString('hex');
 const app = new Hono();
 const crews = new Crews(db, directory);
 const messages = new Messages(db);
+const delivery = new Delivery(db, crews, directory);
 await crews.reconcileAll();
+delivery.start();
 let stopping = false;
 let url = '';
 function status() {
@@ -84,7 +87,8 @@ app.post('/crews/up', async (context) => {
 });
 app.get('/crews/:name', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
-  return context.json(await crews.status(context.req.param('name')));
+  const caller = { crew: context.req.param('name'), seatId: null, executionId: null };
+  return context.json({ ...await crews.status(caller.crew), deliveryIssues: messages.issues(caller) });
 });
 const executionCredential = (header: string | undefined) => header?.startsWith('Bearer ') ? header.slice(7) : '';
 function selectedCaller(header: string | undefined, requested: string | undefined) {
@@ -93,7 +97,10 @@ function selectedCaller(header: string | undefined, requested: string | undefine
   if (requested && requested !== caller.crew) throw new HTTPException(403, { message: 'Managed executions can only inspect their own crew' });
   return { crew: caller.crew, seatId: caller.seatId, executionId: caller.executionId };
 }
-app.get('/crews', async (context) => context.json(await crews.status(selectedCaller(context.req.header('Authorization'), context.req.query('crew')).crew)));
+app.get('/crews', async (context) => {
+  const caller = selectedCaller(context.req.header('Authorization'), context.req.query('crew'));
+  return context.json({ ...await crews.status(caller.crew), deliveryIssues: messages.issues(caller) });
+});
 app.post('/crews/down', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
@@ -108,7 +115,27 @@ app.post('/messages', async (context) => {
   const parsed = submission.safeParse(await context.req.json());
   if (!parsed.success) return context.json({ error: 'Expected recipient, body, requestId, and optional crew only' }, 400);
   const body = parsed.data;
-  return context.json(messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId));
+  const message = messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId);
+  return context.json(message);
+});
+app.post('/messages/:id/retry', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ crew: z.string().min(1).optional(), allowDuplicate: z.boolean().default(false) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected boolean allowDuplicate and optional crew only' }, 400);
+  return context.json(messages.retry(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.allowDuplicate));
+});
+app.post('/messages/:id/reply', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ crew: z.string().min(1).optional(), body: z.string(), requestId: z.string().min(1).max(200) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected body, requestId, and optional crew only' }, 400);
+  const message = messages.reply(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.body, parsed.data.requestId);
+  return context.json(message);
+});
+app.post('/messages/:id/ack', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ crew: z.string().min(1).optional() }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected optional crew only' }, 400);
+  return context.json(messages.ack(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id')));
 });
 app.get('/messages/:id', (context) => context.json(messages.show(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.param('id'))));
 app.get('/inbox', (context) => context.json(messages.inbox(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.query('all') === 'true')));
@@ -150,11 +177,13 @@ server.on('error', (error) => {
 function shutdown() {
   if (stopping) return;
   stopping = true;
+  const delivering = delivery.stop();
   const drainDeadline = setTimeout(() => server.closeAllConnections(), 1000);
   drainDeadline.unref();
   server.close(async () => {
     clearTimeout(drainDeadline);
     await crews.drain();
+    await delivering;
     db.prepare('UPDATE daemon_lifecycle SET pid = NULL, stopped_at = ? WHERE singleton = 1 AND boot_id = ?')
       .run(new Date().toISOString(), bootId);
     db.close();

@@ -38,6 +38,7 @@ interface Execution {
   state: 'active' | 'unknown' | 'stopping' | 'stopped';
   retryable: number;
   created_at: string;
+  runtime_version: string | null;
 }
 
 export class Crews {
@@ -154,7 +155,8 @@ export class Crews {
         let terminalAttempted = false;
         try {
           const binary = process.env.CREW_CLAUDE_BIN ?? 'claude';
-          await exec(binary, ['--version'], { timeout: 5000 });
+          const version = (await exec(binary, ['--version'], { timeout: 5000 })).stdout.trim().match(/^(\d+\.\d+\.\d+)/)?.[1] ?? null;
+          this.db.prepare('UPDATE executions SET runtime_version = ? WHERE id = ?').run(version, executionId);
           const executable = binary.includes('/') ? resolve(binary) : (await exec('which', [binary], { timeout: 5000 })).stdout.trim();
           await mkdir(join(runtimeRoot, 'bin'), { recursive: true, mode: 0o700 });
           const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
@@ -165,7 +167,7 @@ export class Crews {
             `# Project\nProject root: ${config.project}\nWorking directory: ${agent.cwd}`,
             ...guidance,
             `# Crew roster\n${JSON.stringify(config.agents.map((teammate) => ({ seat: teammate.name, runtime: teammate.runtime, role: teammate.role })), null, 2)}`,
-            '# Coordination\nUse `crew whoami --json` to verify your identity, `crew members --json` to inspect teammates and their roles, and `crew status --json` to inspect current execution status. Use `crew send <seat> --text <body> --json` or `--body-file <path>` to persist a message. Use `--request-id <id>` to recover the same submission after a lost response. Use `crew inbox --json` and `crew message show <id> --json` to inspect messages without acknowledging them. These commands select your crew from your managed credential. Messages are persisted with pending delivery; terminal submission and acknowledgment are not implemented yet. Do not claim that a pending message was delivered or received. Only one agent should write project files at a time. Your role instructions do not alter native tool permissions.',
+            '# Coordination\nUse `crew whoami --json` to verify your identity, `crew members --json` to inspect teammates and their roles, and `crew status --json` to inspect current execution status. Use `crew send <seat> --text <body> --json` or `--body-file <path>` to persist a message. Use `--request-id <id>` to recover the same submission after a lost response. Use `crew inbox --json` and `crew message show <id> --json` to inspect messages without acknowledging them. These commands select your crew from your managed credential. Messages are persisted and queued for terminal delivery. Inspect delivery status: pending waits for safe input, submitted records terminal submission, and uncertain may have affected input and will not retry automatically. Eligible pending work resumes after daemon restart. Inspect crew status for deliveryIssues and full attempt history. Explicit `crew message retry <id>` creates a new attempt for a definite failure; uncertain outcomes require `--allow-duplicate`. Acknowledged messages cannot be retried. Submission does not prove receipt or task completion. Use `crew ack <message-id> --json` to acknowledge receipt. Use `crew reply <message-id> --text <body> --json` (or --body-file) to send a linked reply and acknowledge the original atomically. Only the current recipient execution can acknowledge or reply. Operator-directed replies remain inspectable in the inbox. Only one agent should write project files at a time. Your role instructions do not alter native tool permissions.',
           ].join('\n\n');
           await writeFile(contextPath, context, { mode: 0o600 });
           const runner = fileURLToPath(new URL('./agent-runner.js', import.meta.url));
@@ -281,6 +283,28 @@ export class Crews {
     for (const crew of this.db.prepare('SELECT name FROM crews').all() as { name: string }[]) await this.reconcileCrew(crew.name, false);
   }
 
+  withRecipient<T>(seatId: string, operation: () => Promise<T>) {
+    const crew = this.db.prepare('SELECT c.name FROM crews c JOIN seats s ON s.crew_id = c.id WHERE s.id = ?').get(seatId) as { name: string };
+    return this.serial(crew.name, operation);
+  }
+
+  async deliveryTarget(seatId: string) {
+    const seat = this.db.prepare('SELECT crew_id FROM seats WHERE id = ?').get(seatId) as { crew_id: string };
+    const execution = this.rows(seat.crew_id).find((row) => row.seat_id === seatId)!;
+    if (execution.state !== 'active' || execution.status !== 'ready' || !execution.tmux_pane)
+      return { target: null, reason: 'Recipient execution is not confirmed ready' };
+    const observed = await this.binding(execution);
+    if (observed.ownership !== 'owned' || !observed.ready || observed.reason)
+      return { target: null, reason: observed.reason ?? 'Recipient process is unverified' };
+    return { target: { executionId: execution.id, generation: execution.generation, seatId, pane: execution.tmux_pane,
+      session: `crew-${execution.id}`, runnerPid: observed.receipt!.runnerPid, version: execution.runtime_version }, reason: null };
+  }
+
+  currentTarget(target: { executionId: string; generation: string; pane: string }) {
+    return !!this.db.prepare("SELECT id FROM executions WHERE id = ? AND generation = ? AND tmux_pane = ? AND state = 'active' AND status = 'ready'")
+      .get(target.executionId, target.generation, target.pane);
+  }
+
   private async stopExecution(execution: Execution) {
     if (execution.state === 'stopped') return;
     const observed = await this.binding(execution);
@@ -329,7 +353,7 @@ export class Crews {
       : seats.every((seat) => seat.state === 'stopped') ? 'stopped'
       : seats.some((seat) => seat.status === 'failed') ? 'failed'
       : seats.every((seat) => seat.state === 'active' && seat.status === 'ready') ? 'ready' : 'launching', seats: seats.map((seat) => ({
-      name: seat.name, seatId: seat.seat_id, role: seat.role, roleFile: seat.role_path, runtime: 'claude', cwd: seat.cwd,
+      name: seat.name, seatId: seat.seat_id, role: seat.role, roleFile: seat.role_path, runtime: 'claude', nativeVersion: seat.runtime_version, cwd: seat.cwd,
       executionId: seat.id, generation: seat.generation, nativeSessionId: seat.native_session_id,
       status: seat.state === 'active' ? seat.status : seat.state, failure: seat.failure, contextFile: seat.context_path,
       history: (this.db.prepare('SELECT id, generation, native_session_id, status, state, failure, created_at FROM executions WHERE seat_id = ? ORDER BY rowid').all(seat.seat_id) as { id: string; generation: string; native_session_id: string; status: string; state: string; failure: string | null; created_at: string }[])
