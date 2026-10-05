@@ -832,8 +832,8 @@ test('an operator can persist and inspect a pending message to a stopped seat', 
     recipient: { seat: 'investigator' }, acknowledgedAt: null, deliveries: [{ status: 'pending', executionId: null }] });
   expect(sent.id).toBeTruthy();
   const shown = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
-  expect(shown).toEqual(sent);
-  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages).toEqual([sent]);
+  expect(shown).toEqual({ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] });
+  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages).toEqual([{ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] }]);
 }, 20000);
 
 test('submission retries recover the original message across restart and reject conflicting reuse', async () => {
@@ -889,7 +889,7 @@ test('managed messages derive their sender and enforce crew and participant scop
   expect(await (await fetch(`${discovery.url}/inbox`, { headers: coderHeaders })).json()).toMatchObject({ messages: [sent] });
   expect(await (await fetch(`${discovery.url}/inbox?all=true`, { headers: coderHeaders })).json()).toMatchObject({ messages: [sent] });
   expect((await fetch(`${discovery.url}/messages/${sent.id}`, { headers: { Authorization: `Bearer ${reviewerToken}` } })).status).toBe(404);
-  expect(await (await fetch(`${discovery.url}/messages/${sent.id}`, { headers: coderHeaders })).json()).toEqual(sent);
+  expect(await (await fetch(`${discovery.url}/messages/${sent.id}`, { headers: coderHeaders })).json()).toEqual({ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] });
   expect((await exec('tmux', ['-S', crew.seats[1].tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', crew.seats[1].tmux.pane])).stdout).not.toContain('unique-persisted-only-request');
   await cli(state, 'down', '--crew', 'sample');
   expect((await send(plannerToken)).status).toBe(401);
@@ -943,7 +943,7 @@ test('operator messaging requires unambiguous crew selection and validates the H
     const response = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify(body) });
     expect(response.status).toBe(400);
   }
-  expect(JSON.parse((await cli(state, 'inbox', '--crew', 'sample', '--json')).stdout).messages).toEqual([sent]);
+  expect(JSON.parse((await cli(state, 'inbox', '--crew', 'sample', '--json')).stdout).messages).toEqual([{ ...sent, deliveries: [expect.objectContaining({ id: sent.deliveries[0].id, status: 'pending' })] }]);
 }, 20000);
 
 test.each(['delivery', 'delivery-slow'] as const)('a full literal message is submitted to the verified ready terminal without acknowledgment (%s)', async (mode) => {
@@ -1120,3 +1120,66 @@ test('missing executions require an explicit crew shutdown before a fresh launch
   const launched = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
   expect(launched.seats[0].executionId).not.toBe(before.seats[0].executionId);
 }, 25000);
+
+test('only the current recipient can acknowledge, and inspection does not create receipt', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  await cli(state, 'up', config);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const coder = await readFile(join(directory, 'credential-coder'), 'utf8');
+  const reviewer = await readFile(join(directory, 'credential-reviewer'), 'utf8');
+  const sent = JSON.parse((await cli(state, 'send', 'coder', '--text', 'Please inspect.', '--json')).stdout);
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const ack = (token: string, extra = {}) => fetch(`${discovery.url}/messages/${sent.id}/ack`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify(extra) });
+  expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).acknowledgedAt).toBeNull();
+  expect((await ack(reviewer)).status).toBe(404);
+  expect((await ack(discovery.token)).status).toBe(403);
+  expect((await ack(coder, { crew: 'other' })).status).toBe(403);
+  const received = JSON.parse((await exec(process.execPath, [cliPath, '--state-dir', state, 'ack', sent.id, '--json'], { env: { ...process.env, CREW_EXECUTION_TOKEN: coder } })).stdout);
+  expect(received.acknowledgment).toMatchObject({ executionId: expect.any(String), acknowledgedAt: expect.any(String) });
+  expect((await (await ack(coder)).json()).acknowledgment).toEqual(received.acknowledgment);
+  expect((await (await fetch(`${discovery.url}/inbox`, { headers: { Authorization: `Bearer ${coder}` } })).json()).messages).toHaveLength(0);
+  expect((await (await fetch(`${discovery.url}/inbox?all=true`, { headers: { Authorization: `Bearer ${coder}` } })).json()).messages).toHaveLength(1);
+  await cli(state, 'down', '--crew', 'sample');
+  expect((await ack(coder)).status).toBe(401);
+}, 25000);
+
+test('linked replies atomically acknowledge their original and preserve request identity and operator routing', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  await cli(state, 'up', config);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const coder = await readFile(join(directory, 'credential-coder'), 'utf8');
+  const planner = await readFile(join(directory, 'credential-planner'), 'utf8');
+  const reviewer = await readFile(join(directory, 'credential-reviewer'), 'utf8');
+  const managed = (token: string, ...args: string[]) => exec(process.execPath, [cliPath, '--state-dir', state, ...args], { env: { ...process.env, CREW_EXECUTION_TOKEN: token } });
+  const original = JSON.parse((await managed(planner, 'send', 'coder', '--text', 'Inspect.', '--json')).stdout);
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const reply = (token: string, id: string, body: string, requestId = 'reply-1') => fetch(`${discovery.url}/messages/${id}/reply`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify({ body, requestId }) });
+  expect((await reply(reviewer, original.id, 'No.')).status).toBe(404);
+  expect((await reply(planner, original.id, 'No.')).status).toBe(403);
+  expect(JSON.parse((await cli(state, 'message', 'show', original.id, '--json')).stdout).acknowledgedAt).toBeNull();
+  const body = "Findings: café 雪\n'quotes' `echo literal` $(echo literal)\n";
+  const file = join(directory, 'reply.txt');
+  await writeFile(file, body);
+  const created = JSON.parse((await managed(coder, 'reply', original.id, '--body-file', file, '--request-id', 'reply-1', '--json')).stdout);
+  expect(created).toMatchObject({ body, replyTo: original.id, sender: { seat: 'coder' }, recipient: { kind: 'agent', seat: 'planner' }, deliveries: [{ status: 'pending' }] });
+  expect(created.id).not.toBe(original.id);
+  const shown = JSON.parse((await cli(state, 'message', 'show', original.id, '--json')).stdout);
+  expect(shown).toMatchObject({ acknowledgment: { executionId: expect.any(String) }, replies: [{ id: created.id }] });
+  expect((await (await reply(coder, original.id, body)).json()).id).toBe(created.id);
+  expect((await reply(coder, original.id, 'Changed.')).status).toBe(409);
+  await expect(managed(coder, 'send', 'planner', '--text', body, '--request-id', 'reply-1')).rejects.toMatchObject({ stderr: expect.stringContaining('different content') });
+  const operatorMessage = JSON.parse((await cli(state, 'send', 'coder', '--text', 'Report to operator.', '--json')).stdout);
+  expect((await reply(coder, operatorMessage.id, body)).status).toBe(409);
+  expect(JSON.parse((await cli(state, 'message', 'show', operatorMessage.id, '--json')).stdout).acknowledgedAt).toBeNull();
+  const humanReply = await (await reply(coder, operatorMessage.id, 'Operator findings.', 'reply-human')).json();
+  expect(humanReply).toMatchObject({ recipient: { kind: 'operator', seat: null, seatId: null }, replyTo: operatorMessage.id, deliveries: [] });
+  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages.map((m: { id: string }) => m.id)).toContain(humanReply.id);
+  await expect(managed(coder, 'reply', original.id)).rejects.toMatchObject({ stderr: expect.stringContaining('exactly one') });
+  await expect(managed(coder, 'reply', original.id, '--text', 'x', '--body-file', file)).rejects.toMatchObject({ stderr: expect.stringContaining('exactly one') });
+  await cli(state, 'daemon', 'stop');
+  await cli(state, 'daemon', 'start');
+  expect(JSON.parse((await cli(state, 'message', 'show', original.id, '--json')).stdout).acknowledgment).toEqual(shown.acknowledgment);
+  expect(JSON.parse((await cli(state, 'message', 'show', humanReply.id, '--json')).stdout)).toEqual(humanReply);
+}, 30000);

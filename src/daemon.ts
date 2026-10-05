@@ -114,6 +114,20 @@ app.post('/messages', async (context) => {
   delivery.enqueue(message.id);
   return context.json(message);
 });
+app.post('/messages/:id/reply', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ crew: z.string().min(1).optional(), body: z.string(), requestId: z.string().min(1).max(200) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected body, requestId, and optional crew only' }, 400);
+  const message = messages.reply(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.body, parsed.data.requestId);
+  delivery.enqueue(message.id);
+  return context.json(message);
+});
+app.post('/messages/:id/ack', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ crew: z.string().min(1).optional() }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected optional crew only' }, 400);
+  return context.json(messages.ack(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id')));
+});
 app.get('/messages/:id', (context) => context.json(messages.show(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.param('id'))));
 app.get('/inbox', (context) => context.json(messages.inbox(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.query('all') === 'true')));
 app.get('/whoami', (context) => context.json(crews.whoami(executionCredential(context.req.header('Authorization')))));

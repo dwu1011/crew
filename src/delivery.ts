@@ -64,7 +64,7 @@ export class Delivery {
     const target = resolved.target;
     const input = await observeClaudeInput(this.crews.socket, target.pane, target.version);
     if (input.state !== 'empty') { defer(input.reason!); return; }
-    const envelope = `[Crew message ${attempt.message_id}]\nSender: ${attempt.sender ?? 'operator'}\nRecipient: ${attempt.recipient}\nBody:\n${attempt.body}\nReply guidance: reference message ${attempt.message_id} when replying. Explicit crew reply/ack commands are not available yet.`;
+    const envelope = `[Crew message ${attempt.message_id}]\nSender: ${attempt.sender ?? 'operator'}\nRecipient: ${attempt.recipient}\nBody:\n${attempt.body}\nReply guidance: crew reply ${attempt.message_id} --text <body>; or crew ack ${attempt.message_id}.`;
     const root = join(this.directory, 'delivery');
     const path = join(root, `${attempt.id}.txt`);
     const buffer = `crew-${attempt.id}`;
