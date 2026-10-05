@@ -724,6 +724,132 @@ process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).stat
 }, 25000);
 
 
+test('an operator can persist and inspect a pending message to a stopped seat', async () => {
+  const { state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config, '--json');
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  await cli(state, 'down', '--crew', 'sample');
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Inspect the parser.', '--request-id', 'operator-request', '--json')).stdout);
+  expect(sent).toMatchObject({ requestId: 'operator-request', body: 'Inspect the parser.', sender: { kind: 'operator', seat: null, executionId: null },
+    recipient: { seat: 'investigator' }, acknowledgedAt: null, deliveries: [{ status: 'pending', executionId: null }] });
+  expect(sent.id).toBeTruthy();
+  const shown = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
+  expect(shown).toEqual(sent);
+  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages).toEqual([sent]);
+}, 20000);
+
+test('submission retries recover the original message across restart and reject conflicting reuse', async () => {
+  const { state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  let discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const submit = () => fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` },
+    body: JSON.stringify({ recipient: 'investigator', body: 'Recover this request.', requestId: 'lost-response' }) });
+  const first = await submit();
+  expect(first.status).toBe(200);
+  await first.body!.cancel();
+  const recovered = await (await submit()).json();
+  expect(recovered).toMatchObject({ body: 'Recover this request.', deliveries: [{ status: 'pending' }] });
+  const concurrent = await Promise.all([submit(), submit()]);
+  for (const response of concurrent) expect(await response.json()).toEqual(recovered);
+  await cli(state, 'daemon', 'stop');
+  await cli(state, 'daemon', 'start');
+  discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  expect(await (await submit()).json()).toEqual(recovered);
+  const conflict = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` },
+    body: JSON.stringify({ recipient: 'investigator', body: 'Changed contents.', requestId: 'lost-response' }) });
+  expect(conflict.status).toBe(409);
+  expect(JSON.parse((await cli(state, 'inbox', '--all', '--json')).stdout).messages).toEqual([recovered]);
+  expect(JSON.parse((await cli(state, 'message', 'show', recovered.id, '--json')).stdout).acknowledgedAt).toBeNull();
+}, 20000);
+
+test('managed messages derive their sender and enforce crew and participant scope', async () => {
+  const { directory, state, config, binary } = await multiFixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
+  const crew = JSON.parse((await cli(state, 'status', '--json')).stdout);
+  const plannerToken = await readFile(join(directory, 'credential-planner'), 'utf8');
+  const coderToken = await readFile(join(directory, 'credential-coder'), 'utf8');
+  const reviewerToken = await readFile(join(directory, 'credential-reviewer'), 'utf8');
+  const sent = JSON.parse((await exec(process.execPath, [cliPath, '--state-dir', state, 'send', 'coder', '--text', 'unique-persisted-only-request', '--request-id', 'agent-request', '--json'],
+    { env: { ...process.env, CREW_EXECUTION_TOKEN: plannerToken } })).stdout);
+  expect(sent.sender).toEqual({ kind: 'agent', seat: 'planner', seatId: crew.seats[0].seatId, executionId: crew.seats[0].executionId });
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const send = (credential: string, extra = {}) => fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${credential}` },
+    body: JSON.stringify({ recipient: 'coder', body: 'A request.', requestId: 'other-request', ...extra }) });
+  expect((await send(plannerToken, { senderSeat: 'reviewer' })).status).toBe(400);
+  expect((await send(plannerToken, { crew: 'other' })).status).toBe(403);
+  expect((await send('invalid')).status).toBe(401);
+  expect((await send(discovery.token, { recipient: 'missing' })).status).toBe(404);
+  const coderHeaders = { Authorization: `Bearer ${coderToken}` };
+  expect(await (await fetch(`${discovery.url}/inbox`, { headers: coderHeaders })).json()).toMatchObject({ messages: [sent] });
+  expect(await (await fetch(`${discovery.url}/inbox?all=true`, { headers: coderHeaders })).json()).toMatchObject({ messages: [sent] });
+  expect((await fetch(`${discovery.url}/messages/${sent.id}`, { headers: { Authorization: `Bearer ${reviewerToken}` } })).status).toBe(404);
+  expect(await (await fetch(`${discovery.url}/messages/${sent.id}`, { headers: coderHeaders })).json()).toEqual(sent);
+  expect((await exec('tmux', ['-S', crew.seats[1].tmux.socket, 'capture-pane', '-p', '-J', '-S', '-', '-t', crew.seats[1].tmux.pane])).stdout).not.toContain('unique-persisted-only-request');
+  await cli(state, 'down', '--crew', 'sample');
+  expect((await send(plannerToken)).status).toBe(401);
+}, 20000);
+
+test('CLI preserves literal file and stdin bodies and reports a recoverable request identity', async () => {
+  const { directory, state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  const sentinel = join(directory, 'must-not-exist');
+  const body = `Unicode: café 雪\nQuotes: ' "\nBackticks: \`touch ${sentinel}\`\nShell: $(touch ${sentinel})\n`;
+  const file = join(directory, 'message.txt');
+  await writeFile(file, body);
+  const fileResult = await cli(state, 'send', 'investigator', '--body-file', file, '--json');
+  const sent = JSON.parse(fileResult.stdout);
+  expect(sent.body).toBe(body);
+  expect(fileResult.stderr).toContain(sent.requestId);
+  const stdinResult = await new Promise<string>((resolveOutput, reject) => {
+    const child = execFile(process.execPath, [cliPath, '--state-dir', state, 'send', 'investigator', '--body-file', '-', '--json'],
+      (error, stdout) => error ? reject(error) : resolveOutput(stdout));
+    const bytes = Buffer.from(body);
+    const split = bytes.indexOf(Buffer.from('雪')) + 1;
+    child.stdin!.write(bytes.subarray(0, split));
+    child.stdin!.end(bytes.subarray(split));
+  });
+  expect(JSON.parse(stdinResult).body).toBe(body);
+  await expect(readFile(sentinel)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(cli(state, 'send', 'investigator', '--json')).rejects.toMatchObject({ stderr: expect.stringContaining('exactly one') });
+  await expect(cli(state, 'send', 'investigator', '--text', 'one', '--body-file', file)).rejects.toMatchObject({ stderr: expect.stringContaining('exactly one') });
+  expect(JSON.parse((await cli(state, 'inbox', '--json')).stdout).messages).toHaveLength(2);
+}, 20000);
+
+test('operator messaging requires unambiguous crew selection and validates the HTTP contract', async () => {
+  const { directory, state, config, binary } = await fixture();
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
+    env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
+  });
+  await cli(state, 'up', config);
+  const other = join(directory, 'other.yaml');
+  await writeFile(other, (await readFile(config, 'utf8')).replace('name: sample', 'name: other'));
+  await cli(state, 'up', other);
+  await expect(cli(state, 'send', 'investigator', '--text', 'Unselected.')).rejects.toMatchObject({ stderr: expect.stringContaining('Multiple crews') });
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--crew', 'sample', '--text', 'Selected.', '--request-id', 'selected-request', '--json')).stdout);
+  await expect(cli(state, 'message', 'show', sent.id, '--crew', 'other')).rejects.toMatchObject({ stderr: expect.stringContaining('not found') });
+  expect(JSON.parse((await cli(state, 'inbox', '--crew', 'other', '--all', '--json')).stdout).messages).toEqual([]);
+  const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  for (const body of [null, { crew: 'sample', recipient: 'investigator', body: 'Missing request ID.' },
+    { crew: 'sample', recipient: 'investigator', body: 12, requestId: 'invalid-body' }]) {
+    const response = await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify(body) });
+    expect(response.status).toBe(400);
+  }
+  expect(JSON.parse((await cli(state, 'inbox', '--crew', 'sample', '--json')).stdout).messages).toEqual([sent]);
+}, 20000);
+
 test('missing executions require an explicit crew shutdown before a fresh launch', async () => {
   const { state, config, binary } = await fixture();
   await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {

@@ -165,7 +165,7 @@ export class Crews {
             `# Project\nProject root: ${config.project}\nWorking directory: ${agent.cwd}`,
             ...guidance,
             `# Crew roster\n${JSON.stringify(config.agents.map((teammate) => ({ seat: teammate.name, runtime: teammate.runtime, role: teammate.role })), null, 2)}`,
-            '# Coordination\nUse `crew whoami --json` to verify your identity, `crew members --json` to inspect teammates and their roles, and `crew status --json` to inspect current execution status. These commands select your crew from your managed credential. Messaging is not implemented yet; do not claim that you sent messages. Only one agent should write project files at a time. Your role instructions do not alter native tool permissions.',
+            '# Coordination\nUse `crew whoami --json` to verify your identity, `crew members --json` to inspect teammates and their roles, and `crew status --json` to inspect current execution status. Use `crew send <seat> --text <body> --json` or `--body-file <path>` to persist a message. Use `--request-id <id>` to recover the same submission after a lost response. Use `crew inbox --json` and `crew message show <id> --json` to inspect messages without acknowledging them. These commands select your crew from your managed credential. Messages are persisted with pending delivery; terminal submission and acknowledgment are not implemented yet. Do not claim that a pending message was delivered or received. Only one agent should write project files at a time. Your role instructions do not alter native tool permissions.',
           ].join('\n\n');
           await writeFile(contextPath, context, { mode: 0o600 });
           const runner = fileURLToPath(new URL('./agent-runner.js', import.meta.url));

@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: Launch and discover a complete crew (including manual acceptance).
 
-**Status:** awaiting-manual-validation
+**Status:** accepted-for-progression
 
 - [x] Repeated startup with matching effective configuration reuses confirmed healthy executions and can complete missing launches after a known launch failure.
 - [x] Changed configuration is reported without silently replacing active agents.
@@ -28,11 +28,13 @@
 - Final `bun run test`: 40 passed, 1 opt-in native smoke test skipped. Tests use real tmux, a real daemon, temporary SQLite, and controlled native executable fixtures.
 - Standards and spec reviews against `e1d74d4`: no remaining findings after fixes. Regression tests cover delayed process receipts, shutdown in progress, native processes surviving terminal closure, and failed process inspection during startup or shutdown.
 - Ticket 3 PR: https://github.com/dwu1011/crew/pull/3.
-- Manual acceptance is pending; ticket 5 has not started.
+- After execution-token validation, the user requested PR 4 and implementation of ticket 5; progression is authorized.
 
 ## Completion gate
 
-Present exact commands and expected observations after automated checks pass. Stop for explicit manual acceptance before proceeding. No manual acceptance has been recorded.
+The original gate required presenting exact commands and expected observations, then waiting for user sign-off before proceeding.
+
+The user requested PR 4 and implementation of the next slice after execution-token validation on 2026-10-04. This authorizes progression to ticket 5; the individual manual checkboxes above remain an historical record of checks the user has not separately reported.
 
 
 ## Manual handoff
@@ -98,4 +100,4 @@ bun run crew down --crew demo-crew
 bun run crew daemon stop
 ```
 
-Unlike detach or daemon stop, `crew down` terminates native agents. Manual acceptance is pending. Do not start ticket 5 without user sign-off.
+Unlike detach or daemon stop, `crew down` terminates native agents. The user has authorized progression to ticket 5.
