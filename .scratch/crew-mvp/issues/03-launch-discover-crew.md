@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: Launch one agent with role and identity (including manual acceptance).
 
-**Status:** awaiting-manual-validation
+**Status:** accepted-for-progression
 
 - [x] A multi-seat configuration launches each supported seat with its own role, identity, execution, and tmux terminal.
 - [x] Agents receive the teammate roster and can query members and roles through the CLI and HTTP interface.
@@ -114,3 +114,5 @@ node dist/cli.js --state-dir "$CREW_PARTIAL_HOME" daemon stop
 ```
 
 Daemon stop alone intentionally leaves Claude terminals running. Keep the manual checklist unchecked until the user supplies results. Do not start ticket 4 without user acceptance.
+
+The user reported the tiled crew view working and explicitly requested PR 3 and ticket 4 implementation. Progression is authorized; individual manual checklist outcomes were not all supplied and remain unchecked.
