@@ -138,6 +138,7 @@ if (phase === 'draft' && args.includes('if-shell') && args.some(arg => arg.inclu
 if (phase === 'target' && args.includes('load-buffer')) {
   const socket = args[args.indexOf('-S') + 1];
   replace(socket);
+  writeFileSync(${JSON.stringify(marker)}, 'replaced');
 }
 process.exit(result.status ?? 1);
 `, { mode: 0o700 });
@@ -1054,11 +1055,12 @@ test('submitting precedes paste and an ambiguous paste failure stays uncertain',
 }, 20000);
 
 test('a terminal replaced after preparation receives no stale message input', async () => {
-  const { state, config } = await deliveryFault('target');
+  const { state, config, marker } = await deliveryFault('target');
   await cli(state, 'up', config);
   const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Never write to a replacement terminal.', '--json')).stdout);
+  await expect.poll(() => readFile(marker, 'utf8').catch(() => ''), { timeout: 8000 }).toBe('replaced');
   await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0],
-    { timeout: 8000 }).toMatchObject({ status: 'failed', failure: expect.stringContaining('target changed') });
+    { timeout: 8000 }).toMatchObject({ status: 'pending', executionId: null, failure: expect.any(String) });
   const socket = join(state, 'tmux.sock');
   expect((await exec('tmux', ['-S', socket, 'capture-pane', '-p', '-t', '%0'])).stdout).not.toContain(sent.id);
   expect((await exec('tmux', ['-S', socket, 'list-panes', '-a', '-F', '#{pane_current_command}'])).stdout.trim()).toBe('sleep');
@@ -1182,4 +1184,77 @@ test('linked replies atomically acknowledge their original and preserve request 
   await cli(state, 'daemon', 'start');
   expect(JSON.parse((await cli(state, 'message', 'show', original.id, '--json')).stdout).acknowledgment).toEqual(shown.acknowledgment);
   expect(JSON.parse((await cli(state, 'message', 'show', humanReply.id, '--json')).stdout)).toEqual(humanReply);
+}, 30000);
+
+test('persisted pending delivery survives stopped recipients and restart, then targets the new generation once', async () => {
+  const { directory, state, config, binary } = await fixture('delivery');
+  const start = () => exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  await start();
+  await cli(state, 'up', config);
+  await expect.poll(() => readFile(join(directory, 'current-draft.txt'), 'utf8').catch(() => null)).toBe('');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await cli(state, 'down', '--crew', 'sample');
+  const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Stopped recipient recovery.', '--json')).stdout);
+  await cli(state, 'daemon', 'stop');
+  await start();
+  expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status).toBe('pending');
+  await cli(state, 'up', config);
+  await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0].status, { timeout: 8000 }).toBe('submitted');
+  const after = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  expect(after.seatId).toBe(before.seatId);
+  expect(after.executionId).not.toBe(before.executionId);
+  expect(after.generation).not.toBe(before.generation);
+  const shown = JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout);
+  expect(shown.deliveries).toMatchObject([{ executionId: after.executionId, generation: after.generation, status: 'submitted' }]);
+  expect(shown.deliveries).toHaveLength(1);
+  await cli(state, 'daemon', 'stop');
+  await start();
+  expect(JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0].executionId).toBe(after.executionId);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  const received = JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'));
+  expect(received).toHaveLength(1);
+  expect(received[0]).toContain(sent.id);
+  expect(JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries).toEqual(shown.deliveries);
+}, 30000);
+
+test('startup reconciles before delivery and HTTP pending work resumes on the same surviving execution', async () => {
+  const { directory, state, config, binary } = await fixture('delivery');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  await cli(state, 'up', config);
+  await expect.poll(() => readFile(join(directory, 'current-draft.txt'), 'utf8').catch(() => null)).toBe('');
+  const before = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await exec('tmux', ['-S', before.tmux.socket, 'send-keys', '-t', before.tmux.pane, '-l', 'USER_DRAFT']);
+  let discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const sent = await (await fetch(`${discovery.url}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${discovery.token}` }, body: JSON.stringify({ recipient: 'investigator', body: 'HTTP restart recovery.', requestId: 'http-recover' }) })).json();
+  await cli(state, 'daemon', 'stop');
+  const tmux = (await exec('which', ['tmux'])).stdout.trim(), bin = join(directory, 'reconcile-bin');
+  const marker = join(directory, 'reconciling'), release = join(directory, 'reconcile-release');
+  await mkdir(bin);
+  await writeFile(join(bin, 'tmux'), `#!${process.execPath}
+const { spawnSync } = await import('node:child_process');
+const { existsSync, writeFileSync } = await import('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('has-session') && !existsSync(${JSON.stringify(release)})) {
+  writeFileSync(${JSON.stringify(marker)}, 'reconciling');
+  const deadline = Date.now() + 1500;
+  while (!existsSync(${JSON.stringify(release)}) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+}
+process.exit(spawnSync(${JSON.stringify(tmux)}, args, { stdio: 'inherit' }).status ?? 1);
+`, { mode: 0o700 });
+  const restarting = exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary, PATH: `${bin}:${process.env.PATH}` } });
+  try {
+    await expect.poll(() => readFile(marker, 'utf8').catch(() => '')).toBe('reconciling');
+    expect(await readFile(join(directory, 'current-draft.txt'), 'utf8')).toBe('USER_DRAFT');
+    await expect(readFile(join(directory, 'received.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  } finally { await writeFile(release, 'release'); await restarting; }
+  discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+  const show = async () => (await fetch(`${discovery.url}/messages/${sent.id}`, { headers: { Authorization: `Bearer ${discovery.token}` } })).json();
+  expect((await show()).deliveries[0].status).toBe('pending');
+  const after = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  expect(after.executionId).toBe(before.executionId);
+  expect(after.generation).toBe(before.generation);
+  expect(after.nativeSessionId).toBe(before.nativeSessionId);
+  await exec('tmux', ['-S', before.tmux.socket, 'send-keys', '-t', before.tmux.pane, 'C-u']);
+  await expect.poll(async () => (await show()).deliveries[0], { timeout: 8000 }).toMatchObject({ status: 'submitted', executionId: before.executionId, generation: before.generation });
+  expect(JSON.parse(await readFile(join(directory, 'received.json'), 'utf8'))).toHaveLength(1);
 }, 30000);

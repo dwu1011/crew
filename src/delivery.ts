@@ -12,10 +12,9 @@ interface Pending {
 }
 
 export class Delivery {
-  private accepted = new Set<string>();
   private jobs = new Map<string, Promise<void>>();
   private stopping = false;
-  private timer: ReturnType<typeof setInterval>;
+  private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private db: Database.Database, private crews: Crews, private directory: string) {
     db.transaction(() => {
@@ -27,12 +26,12 @@ export class Delivery {
         ALTER TABLE delivery_attempts ADD COLUMN submitted_at TEXT;`);
       db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('006_terminal_delivery', new Date().toISOString());
     }).immediate();
-    this.timer = setInterval(() => this.tick(), 400);
-    this.timer.unref();
   }
 
-  enqueue(id: string) {
-    if (this.db.prepare("SELECT id FROM delivery_attempts WHERE message_id = ? AND status = 'pending'").get(id)) this.accepted.add(id);
+  start() {
+    this.timer = setInterval(() => this.tick(), 400);
+    this.timer.unref();
+    this.tick();
   }
 
   async stop() {
@@ -47,7 +46,7 @@ export class Delivery {
       FROM delivery_attempts a JOIN messages m ON m.id = a.message_id JOIN seats recipient ON recipient.id = m.recipient_seat_id
       LEFT JOIN seats sender ON sender.id = m.sender_seat_id WHERE a.status = 'pending' ORDER BY m.rowid, a.rowid`).all() as Pending[];
     for (const attempt of pending) {
-      if (!this.accepted.has(attempt.message_id) || this.jobs.has(attempt.recipient_seat_id)) continue;
+      if (this.jobs.has(attempt.recipient_seat_id)) continue;
       const task = this.crews.withRecipient(attempt.recipient_seat_id, () => this.deliver(attempt))
         .catch((error: Error) => this.db.prepare("UPDATE delivery_attempts SET failure = ? WHERE id = ? AND status = 'pending'").run(error.message, attempt.id))
         .then(() => {});
@@ -77,7 +76,7 @@ export class Delivery {
       const verified = await this.crews.deliveryTarget(attempt.recipient_seat_id);
       const ready = await observeClaudeInput(this.crews.socket, target.pane, target.version);
       if (!verified.target || verified.target.executionId !== target.executionId || verified.target.generation !== target.generation
-        || verified.target.pane !== target.pane || !this.crews.currentTarget(target)) throw new Error('Recipient target changed before input');
+        || verified.target.pane !== target.pane || !this.crews.currentTarget(target)) { defer('Recipient target changed before input; waiting for verified execution'); return; }
       if (this.stopping || ready.state !== 'empty') { defer(this.stopping ? 'Daemon is stopping' : ready.reason!); return; }
       this.db.prepare("UPDATE delivery_attempts SET status = 'submitting', execution_id = ?, generation = ?, pane = ?, submitting_at = ?, failure = NULL WHERE id = ? AND status = 'pending'")
         .run(target.executionId, target.generation, target.pane, new Date().toISOString(), attempt.id);
@@ -87,7 +86,13 @@ export class Delivery {
       ].map(([key, value]) => `#{==:#{${key}},${value}}`).reduce((previous, check) => `#{&&:${previous},${check}}`);
       const pasted = await tmux(['if-shell', '-F', '-t', target.pane, condition(ready),
         `paste-buffer -t ${target.pane} -b ${buffer} -r ; display-message -p crew-pasted`, 'display-message -p crew-refused']);
-      if (pasted.stdout.trim() !== 'crew-pasted') { if (pasted.stdout.trim() === 'crew-refused') inputAttempted = false; throw new Error('Terminal target or cursor changed before paste'); }
+      if (pasted.stdout.trim() === 'crew-refused') {
+        inputAttempted = false;
+        this.db.prepare("UPDATE delivery_attempts SET status = 'pending', execution_id = NULL, generation = NULL, pane = NULL, submitting_at = NULL, failure = ? WHERE id = ?")
+          .run('Terminal target or cursor changed before paste; waiting for safe input', attempt.id);
+        return;
+      }
+      if (pasted.stdout.trim() !== 'crew-pasted') throw new Error('Paste outcome could not be verified');
       const expectedPrompt = envelope.split('\n').map((line) => line.trimEnd()).join('\n');
       const deadline = Date.now() + 1800;
       let draft: Awaited<ReturnType<typeof observeClaudeInput>>;
@@ -106,11 +111,9 @@ export class Delivery {
       if (entered.stdout.trim() !== 'crew-entered') throw new Error('Terminal target or cursor changed before Enter');
       this.db.prepare("UPDATE delivery_attempts SET status = 'submitted', submitted_at = ?, failure = NULL WHERE id = ? AND status = 'submitting'")
         .run(new Date().toISOString(), attempt.id);
-      this.accepted.delete(attempt.message_id);
     } catch (error) {
       this.db.prepare("UPDATE delivery_attempts SET status = ?, execution_id = ?, generation = ?, pane = ?, failure = ? WHERE id = ?")
         .run(inputAttempted ? 'uncertain' : 'failed', target.executionId, target.generation, target.pane, (error as Error).message, attempt.id);
-      this.accepted.delete(attempt.message_id);
     } finally {
       await tmux(['delete-buffer', '-b', buffer]).catch(() => {});
       await unlink(path).catch(() => {});

@@ -57,6 +57,7 @@ const crews = new Crews(db, directory);
 const messages = new Messages(db);
 const delivery = new Delivery(db, crews, directory);
 await crews.reconcileAll();
+delivery.start();
 let stopping = false;
 let url = '';
 function status() {
@@ -111,7 +112,6 @@ app.post('/messages', async (context) => {
   if (!parsed.success) return context.json({ error: 'Expected recipient, body, requestId, and optional crew only' }, 400);
   const body = parsed.data;
   const message = messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId);
-  delivery.enqueue(message.id);
   return context.json(message);
 });
 app.post('/messages/:id/reply', async (context) => {
@@ -119,7 +119,6 @@ app.post('/messages/:id/reply', async (context) => {
   const parsed = z.object({ crew: z.string().min(1).optional(), body: z.string(), requestId: z.string().min(1).max(200) }).strict().safeParse(await context.req.json());
   if (!parsed.success) return context.json({ error: 'Expected body, requestId, and optional crew only' }, 400);
   const message = messages.reply(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.body, parsed.data.requestId);
-  delivery.enqueue(message.id);
   return context.json(message);
 });
 app.post('/messages/:id/ack', async (context) => {
