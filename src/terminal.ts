@@ -28,7 +28,7 @@ export async function attachSession(socket: string, session: string) {
 
 export async function attachCrew(directory: string, crew: Crew) {
   requireTerminal();
-  const seats = crew.seats.filter((seat) => seat.tmux && seat.status !== 'failed');
+  const seats = crew.seats.filter((seat) => seat.tmux && ['launching', 'ready'].includes(seat.status));
   if (!seats.length) throw new Error(`Crew ${crew.name} has no active terminals.`);
   for (const seat of crew.seats.filter((seat) => !seats.includes(seat))) {
     console.error(`Skipping ${seat.name}: no active terminal (${seat.status}).`);
