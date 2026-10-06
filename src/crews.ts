@@ -10,6 +10,7 @@ import { processIdentity } from './process-identity.js';
 import { processAlive } from './state.js';
 import { loadConfig } from './config.js';
 import { prepareAgentTerminal } from './terminal.js';
+import { ManagedExecutions, type InputOptions, type InputSession } from './managed-executions.js';
 
 const exec = promisify(execFile);
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -46,60 +47,19 @@ export class Crews {
   private operations = new Map<string, Promise<unknown>>();
   private launches = new Set<Promise<unknown>>();
   readonly socket: string;
+  private executions: ManagedExecutions;
 
   constructor(private db: Database.Database, private directory: string) {
-    this.socket = join(directory, 'tmux.sock');
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('002_single_seat')) return;
-      db.exec(`
-        CREATE TABLE crews (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, project TEXT NOT NULL, config_path TEXT NOT NULL);
-        CREATE TABLE seats (id TEXT PRIMARY KEY, crew_id TEXT NOT NULL REFERENCES crews(id), name TEXT NOT NULL,
-          role_path TEXT NOT NULL, UNIQUE(crew_id, name));
-        CREATE TABLE executions (id TEXT PRIMARY KEY, seat_id TEXT NOT NULL REFERENCES seats(id),
-          generation TEXT NOT NULL UNIQUE, native_session_id TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL UNIQUE,
-          status TEXT NOT NULL CHECK (status IN ('launching', 'ready', 'failed')), cwd TEXT NOT NULL,
-          failure TEXT, context_path TEXT, tmux_session TEXT, tmux_pane TEXT,
-          created_at TEXT NOT NULL, ready_at TEXT);
-        CREATE UNIQUE INDEX execution_one_active ON executions(seat_id) WHERE status IN ('launching', 'ready');
-      `);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
-        .run('002_single_seat', new Date().toISOString());
-    }).immediate();
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('003_seat_roles')) return;
-      db.exec('ALTER TABLE seats ADD COLUMN role TEXT');
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
-        .run('003_seat_roles', new Date().toISOString());
-    }).immediate();
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('004_crew_lifecycle')) return;
-      db.exec(`ALTER TABLE crews ADD COLUMN config_digest TEXT;
-        ALTER TABLE executions ADD COLUMN state TEXT NOT NULL DEFAULT 'active';
-        ALTER TABLE executions ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0;
-        DROP INDEX execution_one_active;
-        CREATE UNIQUE INDEX execution_one_active ON executions(seat_id) WHERE state = 'active' AND status IN ('launching', 'ready');`);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('004_crew_lifecycle', new Date().toISOString());
-    }).immediate();
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('011_runtime_activity')) return;
-      db.exec(`CREATE TABLE execution_activity (execution_id TEXT PRIMARY KEY REFERENCES executions(id),
-        event TEXT NOT NULL, state TEXT NOT NULL, event_at TEXT NOT NULL, received_at TEXT NOT NULL)`);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('011_runtime_activity', new Date().toISOString());
-    }).immediate();
+    this.executions = new ManagedExecutions(db, directory);
+    this.socket = this.executions.socket;
   }
 
   activity(executionId: string) {
-    return this.db.prepare('SELECT event, state, event_at AS eventAt, received_at AS receivedAt FROM execution_activity WHERE execution_id = ?').get(executionId) as
-      { event: string; state: string; eventAt: string; receivedAt: string } | undefined;
+    return this.executions.activity(executionId);
   }
 
   recordActivity(executionId: string, event: string, eventAt: string, toolName?: string) {
-    const state = event === 'Stop' || event === 'SessionStart' ? 'idle'
-      : event === 'PermissionRequest' || (event === 'PreToolUse' && ['AskUserQuestion', 'ExitPlanMode'].includes(toolName ?? '')) ? 'needs_input' : 'running';
-    this.db.prepare(`INSERT INTO execution_activity (execution_id, event, state, event_at, received_at) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(execution_id) DO UPDATE SET event = excluded.event, state = excluded.state, event_at = excluded.event_at, received_at = excluded.received_at
-      WHERE excluded.event_at > execution_activity.event_at`).run(executionId, event, state, eventAt, new Date().toISOString());
-    return this.activity(executionId);
+    return this.executions.recordActivity(executionId, event, eventAt, toolName);
   }
 
   private serial<T>(name: string, operation: () => Promise<T>) {
@@ -237,50 +197,13 @@ export class Crews {
       ORDER BY s.rowid`).all(crewId) as (Execution & { name: string; role: string | null })[];
   }
 
-  private async binding(execution: Execution) {
-    let receipt: { executionId: string; generation: string; nativeSessionId: string; cwd: string;
-      runnerPid: number; runnerIdentity: string; nativePid: number | null; nativeIdentity: string | null } | undefined;
-    try {
-      const candidate = JSON.parse(await readFile(join(this.directory, 'executions', execution.id, 'process.json'), 'utf8'));
-      if (!Number.isSafeInteger(candidate?.runnerPid) || candidate.runnerPid < 1
-        || !(candidate.nativePid === null || (Number.isSafeInteger(candidate.nativePid) && candidate.nativePid > 0))) throw new Error('Invalid process receipt');
-      receipt = candidate;
-    }
-    catch { /* Older or incomplete executions cannot prove ownership. */ }
-    let pane: string[];
-    try {
-      await exec('tmux', ['-S', this.socket, 'has-session', '-t', `=crew-${execution.id}`], { timeout: 2000 });
-      pane = (await exec('tmux', ['-S', this.socket, 'display-message', '-p', '-t', execution.tmux_pane ?? `=crew-${execution.id}:0.0`,
-        '#{session_name}\t#{pane_id}\t#{pane_pid}'], { timeout: 2000 })).stdout.trim().split('\t');
-    } catch (error) {
-      const missing = missingTerminal.test((error as { stderr?: string }).stderr ?? '');
-      const alive = receipt && (processAlive(receipt.runnerPid) || (receipt.nativePid !== null && processAlive(receipt.nativePid)));
-      return { ownership: missing && !alive ? 'absent' : 'unknown', ready: false, receipt, reason: missing ? 'Managed terminal or process is missing' : 'Managed terminal cannot be verified' };
-    }
-    if (!receipt || receipt.executionId !== execution.id || receipt.generation !== execution.generation
-      || receipt.nativeSessionId !== execution.native_session_id || receipt.cwd !== execution.cwd
-      || pane[0] !== `crew-${execution.id}` || (execution.tmux_pane && pane[1] !== execution.tmux_pane)
-      || Number(pane[2]) !== receipt.runnerPid || !receipt.runnerIdentity || processIdentity(receipt.runnerPid) !== receipt.runnerIdentity) {
-      return { ownership: 'unknown', ready: false, receipt, reason: 'Managed terminal ownership does not match the recorded execution' };
-    }
-    if (!receipt.nativePid || !receipt.nativeIdentity || processIdentity(receipt.nativePid) !== receipt.nativeIdentity) {
-      return { ownership: 'owned', ready: false, receipt, reason: 'Native process is missing or mismatched' };
-    }
-    let ready = execution.status === 'ready';
-    try {
-      const marker = JSON.parse(await readFile(join(this.directory, 'executions', execution.id, 'ready.json'), 'utf8'));
-      ready ||= marker.generation === execution.generation && marker.sessionId === execution.native_session_id && marker.cwd === execution.cwd;
-    } catch { /* A live process can still be waiting for native startup. */ }
-    return { ownership: 'owned', ready, receipt, reason: null };
-  }
-
   private async reconcileCrew(name: string, startupGrace = true) {
     const crew = this.db.prepare('SELECT id FROM crews WHERE name = ?').get(name) as { id: string } | undefined;
     if (!crew) return;
     for (const execution of this.rows(crew.id)) {
       if (execution.state === 'stopped') continue;
       if (execution.state === 'stopping' && startupGrace) continue;
-      const observed = await this.binding(execution);
+      const observed = await this.executions.inspect(execution);
       if (execution.state === 'stopping') {
         this.db.prepare('UPDATE executions SET state = ?, failure = ? WHERE id = ? AND state = ?')
           .run(observed.ownership === 'absent' ? 'stopped' : 'unknown', observed.ownership === 'absent' ? execution.failure : 'Crew shutdown was interrupted; process state must be checked', execution.id, 'stopping');
@@ -311,34 +234,14 @@ export class Crews {
     }
   }
 
-  withRecipient<T>(seatId: string, operation: () => Promise<T>) {
+  withInput<T>(seatId: string, options: InputOptions, operation: (input: InputSession) => Promise<T>) {
     const crew = this.db.prepare('SELECT c.name FROM crews c JOIN seats s ON s.crew_id = c.id WHERE s.id = ?').get(seatId) as { name: string };
-    return this.serial(crew.name, operation);
-  }
-
-  async deliveryTarget(seatId: string) {
-    const seat = this.db.prepare('SELECT crew_id FROM seats WHERE id = ?').get(seatId) as { crew_id: string };
-    const execution = this.rows(seat.crew_id).find((row) => row.seat_id === seatId)!;
-    if (execution.state !== 'active' || execution.status !== 'ready' || !execution.tmux_pane)
-      return { target: null, reason: 'Recipient execution is not confirmed ready' };
-    const observed = await this.binding(execution);
-    if (observed.ownership !== 'owned' || !observed.ready || observed.reason)
-      return { target: null, reason: observed.reason ?? 'Recipient process is unverified' };
-    const ready = JSON.parse(await readFile(join(this.directory, 'executions', execution.id, 'ready.json'), 'utf8').catch(() => '{}'));
-    if (ready.submissionProtocol !== 1 || ready.generation !== execution.generation || ready.sessionId !== execution.native_session_id || ready.cwd !== execution.cwd)
-      return { target: null, reason: 'Execution has no verified prompt hook; stop and relaunch this crew to install submission verification' };
-    return { target: { executionId: execution.id, generation: execution.generation, seatId, pane: execution.tmux_pane,
-      session: `crew-${execution.id}`, runnerPid: observed.receipt!.runnerPid, activity: this.activity(execution.id) }, reason: null };
-  }
-
-  currentTarget(target: { executionId: string; generation: string; pane: string }) {
-    return !!this.db.prepare("SELECT id FROM executions WHERE id = ? AND generation = ? AND tmux_pane = ? AND state = 'active' AND status = 'ready'")
-      .get(target.executionId, target.generation, target.pane);
+    return this.serial(crew.name, () => this.executions.withInput(seatId, options, operation));
   }
 
   private async stopExecution(execution: Execution) {
     if (execution.state === 'stopped') return;
-    const observed = await this.binding(execution);
+    const observed = await this.executions.inspect(execution);
     if (observed.ownership === 'unknown') throw new HTTPException(409, { message: `Refusing to stop an unverified execution: ${observed.reason}` });
     this.db.prepare("UPDATE executions SET state = 'stopping' WHERE id = ?").run(execution.id);
     try {

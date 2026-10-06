@@ -31,44 +31,6 @@ export class Messages {
   private attempts: DeliveryAttempts;
 
   constructor(private db: Database.Database, crews: Crews, directory: string) {
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('005_durable_messages')) return;
-      db.exec(`CREATE TABLE messages (
-        id TEXT PRIMARY KEY, crew_id TEXT NOT NULL REFERENCES crews(id), request_id TEXT NOT NULL,
-        sender_key TEXT NOT NULL, sender_seat_id TEXT REFERENCES seats(id), sender_execution_id TEXT REFERENCES executions(id),
-        recipient_seat_id TEXT NOT NULL REFERENCES seats(id), body TEXT NOT NULL, created_at TEXT NOT NULL,
-        acknowledged_at TEXT, UNIQUE(crew_id, sender_key, request_id));
-        CREATE INDEX messages_inbox ON messages(recipient_seat_id, acknowledged_at);
-        CREATE TABLE delivery_attempts (
-          id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id),
-          execution_id TEXT REFERENCES executions(id), status TEXT NOT NULL, created_at TEXT NOT NULL, failure TEXT);
-        CREATE INDEX delivery_pending ON delivery_attempts(status);
-      `);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('005_durable_messages', new Date().toISOString());
-    }).immediate();
-    if (!db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('007_message_receipts')) {
-      db.pragma('foreign_keys = OFF');
-      try {
-        db.transaction(() => {
-          db.exec(`CREATE TABLE messages_next (
-            id TEXT PRIMARY KEY, crew_id TEXT NOT NULL REFERENCES crews(id), request_id TEXT NOT NULL,
-            sender_key TEXT NOT NULL, sender_seat_id TEXT REFERENCES seats(id), sender_execution_id TEXT REFERENCES executions(id),
-            recipient_seat_id TEXT REFERENCES seats(id), body TEXT NOT NULL, created_at TEXT NOT NULL,
-            acknowledged_at TEXT, acknowledged_execution_id TEXT REFERENCES executions(id), reply_to TEXT REFERENCES messages(id),
-            UNIQUE(crew_id, sender_key, request_id));
-            INSERT INTO messages_next (id, crew_id, request_id, sender_key, sender_seat_id, sender_execution_id,
-              recipient_seat_id, body, created_at, acknowledged_at)
-              SELECT id, crew_id, request_id, sender_key, sender_seat_id, sender_execution_id,
-                recipient_seat_id, body, created_at, acknowledged_at FROM messages ORDER BY rowid;
-            DROP TABLE messages;
-            ALTER TABLE messages_next RENAME TO messages;
-            CREATE INDEX messages_inbox ON messages(recipient_seat_id, acknowledged_at);
-            CREATE INDEX messages_replies ON messages(reply_to);`);
-          if (db.prepare('PRAGMA foreign_key_check').all().length) throw new Error('Message migration violated foreign keys');
-          db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('007_message_receipts', new Date().toISOString());
-        }).immediate();
-      } finally { db.pragma('foreign_keys = ON'); }
-    }
     this.attempts = new DeliveryAttempts(db, crews, directory);
   }
 

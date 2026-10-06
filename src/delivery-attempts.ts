@@ -1,14 +1,10 @@
 import type Database from 'better-sqlite3';
-import { execFile } from 'node:child_process';
 import { mkdir, writeFile, unlink, readFile, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { HTTPException } from 'hono/http-exception';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import type { Crews } from './crews.js';
-import { observeClaudeInput } from './claude-input.js';
 
-const exec = promisify(execFile);
 interface Pending {
   id: string; message_id: string; recipient_seat_id: string; sender: string | null; body: string;
 }
@@ -58,29 +54,7 @@ export class DeliveryAttempts {
   private stopping = false;
   private timer: ReturnType<typeof setInterval> | undefined;
 
-  constructor(private db: Database.Database, private crews: Crews, private directory: string) {
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('006_terminal_delivery')) return;
-      db.exec(`ALTER TABLE executions ADD COLUMN runtime_version TEXT;
-        ALTER TABLE delivery_attempts ADD COLUMN generation TEXT;
-        ALTER TABLE delivery_attempts ADD COLUMN pane TEXT;
-        ALTER TABLE delivery_attempts ADD COLUMN submitting_at TEXT;
-        ALTER TABLE delivery_attempts ADD COLUMN submitted_at TEXT;`);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('006_terminal_delivery', new Date().toISOString());
-    }).immediate();
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('010_prompt_verification')) return;
-      db.exec(`ALTER TABLE delivery_attempts ADD COLUMN prompt_verified_at TEXT;
-        ALTER TABLE delivery_attempts ADD COLUMN prompt_hash TEXT;
-        ALTER TABLE delivery_attempts ADD COLUMN native_prompt_id TEXT;`);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('010_prompt_verification', new Date().toISOString());
-    }).immediate();
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('009_delivery_retry')) return;
-      db.exec("CREATE UNIQUE INDEX delivery_one_active ON delivery_attempts(message_id) WHERE status IN ('pending', 'submitting')");
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('009_delivery_retry', new Date().toISOString());
-    }).immediate();
-  }
+  constructor(private db: Database.Database, private crews: Crews, private directory: string) {}
 
   enqueue(messageId: string, createdAt: string) {
     this.db.prepare("INSERT INTO delivery_attempts (id, message_id, status, created_at) VALUES (?, ?, 'pending', ?)")
@@ -164,7 +138,7 @@ export class DeliveryAttempts {
       LEFT JOIN seats sender ON sender.id = m.sender_seat_id WHERE a.status = 'pending' AND m.acknowledged_at IS NULL ORDER BY m.rowid, a.rowid`).all() as Pending[];
     for (const attempt of pending) {
       if (this.jobs.has(attempt.recipient_seat_id)) continue;
-      const task = this.crews.withRecipient(attempt.recipient_seat_id, () => this.deliver(attempt))
+      const task = this.deliver(attempt)
         .catch((error: Error) => this.db.prepare("UPDATE delivery_attempts SET failure = ? WHERE id = ? AND status = 'pending'").run(error.message, attempt.id))
         .then(() => {});
       this.jobs.set(attempt.recipient_seat_id, task);
@@ -173,89 +147,56 @@ export class DeliveryAttempts {
   }
 
   private async deliver(attempt: Pending) {
-    if (!this.db.prepare("SELECT a.id FROM delivery_attempts a JOIN messages m ON m.id = a.message_id WHERE a.id = ? AND a.status = 'pending' AND m.acknowledged_at IS NULL").get(attempt.id)) return;
-    const tmux = (args: string[]) => exec('tmux', ['-S', this.crews.socket, ...args], { timeout: 2000 });
     const defer = (reason: string) => this.db.prepare("UPDATE delivery_attempts SET failure = ? WHERE id = ? AND status = 'pending'").run(reason, attempt.id);
-    const resolved = await this.crews.deliveryTarget(attempt.recipient_seat_id);
-    if (!resolved.target) { defer(resolved.reason!); return; }
-    const target = resolved.target;
-    if (target.activity && target.activity.state !== 'idle') { defer(`Native activity ${target.activity.event}: ${target.activity.state}`); return; }
-    const input = await observeClaudeInput(this.crews.socket, target.pane, target.activity?.state === 'idle');
-    if (input.state !== 'empty') { defer(input.reason!); return; }
-    const text = envelope(attempt);
-    const root = join(this.directory, 'delivery');
-    const path = join(root, `${attempt.id}.txt`);
-    const buffer = `crew-${attempt.id}`;
-    const submissions = join(this.directory, 'executions', target.executionId, 'submissions');
-    const submission = join(submissions, `${attempt.id}.json`);
-    const intents = await readdir(submissions).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === 'ENOENT') return [];
-      throw error;
-    });
-    for (const file of intents) {
-      const active = JSON.parse(await readFile(join(submissions, file), 'utf8').catch((error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') return '{}';
+    const prepared = await this.crews.withInput(attempt.recipient_seat_id, { id: attempt.id, isStopping: () => this.stopping }, async (input) => {
+      if (!this.db.prepare("SELECT a.id FROM delivery_attempts a JOIN messages m ON m.id = a.message_id WHERE a.id = ? AND a.status = 'pending' AND m.acknowledged_at IS NULL").get(attempt.id)) return;
+      const target = input.binding;
+      const submissions = join(this.directory, 'executions', target.executionId, 'submissions');
+      const submission = join(submissions, `${attempt.id}.json`);
+      const intents = await readdir(submissions).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return [];
         throw error;
-      }));
-      if (active.messageId && active.messageId !== attempt.message_id) { defer('Previous input is awaiting its native hook decision; inspect or explicitly retry that message'); return; }
-    }
-    let inputAttempted = false;
-    try {
-      if (/[\u0000-\u0009\u000b-\u001f\u007f]/.test(text)) throw new Error('Unsupported terminal control characters in message body');
-      await mkdir(root, { recursive: true, mode: 0o700 });
-      await writeFile(path, text, { mode: 0o600 });
-      await tmux(['load-buffer', '-b', buffer, path]);
-      const verified = await this.crews.deliveryTarget(attempt.recipient_seat_id);
-      const ready = await observeClaudeInput(this.crews.socket, target.pane, verified.target?.activity?.state === 'idle');
-      if (!verified.target || verified.target.executionId !== target.executionId || verified.target.generation !== target.generation
-        || verified.target.pane !== target.pane || !this.crews.currentTarget(target)) { defer('Recipient target changed before input; waiting for verified execution'); return; }
-      if (this.stopping || ready.state !== 'empty' || (verified.target.activity && verified.target.activity.state !== 'idle')) { defer(this.stopping ? 'Daemon is stopping' : ready.reason ?? 'Native execution is no longer idle'); return; }
-      const submitting = this.db.prepare("UPDATE delivery_attempts SET status = 'submitting', execution_id = ?, generation = ?, pane = ?, submitting_at = ?, failure = NULL WHERE id = ? AND status = 'pending' AND EXISTS (SELECT 1 FROM messages WHERE messages.id = delivery_attempts.message_id AND acknowledged_at IS NULL)")
-        .run(target.executionId, target.generation, target.pane, new Date().toISOString(), attempt.id);
-      if (submitting.changes !== 1) return;
-      await mkdir(submissions, { recursive: true, mode: 0o700 });
-      await writeFile(submission, JSON.stringify({ attemptId: attempt.id, messageId: attempt.message_id }), { mode: 0o600, flag: 'wx' });
-      inputAttempted = true;
-      const condition = (frame: { x: number; y: number; width: number; height: number }) => [
-        ['pane_pid', target.runnerPid], ['session_name', target.session], ['cursor_x', frame.x], ['cursor_y', frame.y], ['pane_width', frame.width], ['pane_height', frame.height], ['pane_in_mode', 0], ['pane_input_off', 0],
-      ].map(([key, value]) => `#{==:#{${key}},${value}}`).reduce((previous, check) => `#{&&:${previous},${check}}`);
-      const pasted = await tmux(['if-shell', '-F', '-t', target.pane, condition(ready),
-        `paste-buffer -t ${target.pane} -b ${buffer} -r -p ; display-message -p crew-pasted`, 'display-message -p crew-refused']);
-      if (pasted.stdout.trim() === 'crew-refused') {
-        inputAttempted = false;
-        this.db.prepare("UPDATE delivery_attempts SET status = 'pending', execution_id = NULL, generation = NULL, pane = NULL, submitting_at = NULL, failure = ? WHERE id = ?")
-          .run('Terminal target or cursor changed before paste; waiting for safe input', attempt.id);
-        return;
+      });
+      for (const file of intents) {
+        const active = JSON.parse(await readFile(join(submissions, file), 'utf8').catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return '{}';
+          throw error;
+        }));
+        if (active.messageId && active.messageId !== attempt.message_id) { defer('Previous input is awaiting its native hook decision; inspect or explicitly retry that message'); return; }
       }
-      if (pasted.stdout.trim() !== 'crew-pasted') throw new Error('Paste outcome could not be verified');
-      const deadline = Date.now() + 1800;
-      let draft: Awaited<ReturnType<typeof observeClaudeInput>>;
-      for (;;) {
-        const after = await this.crews.deliveryTarget(attempt.recipient_seat_id);
-        draft = await observeClaudeInput(this.crews.socket, target.pane, after.target?.activity?.state === 'idle');
-        if (this.stopping || !after.target || after.target.executionId !== target.executionId || !this.crews.currentTarget(target) || draft.state === 'blocked' || after.target.activity && after.target.activity.state !== 'idle')
-          throw new Error('Recipient target or input safety changed after paste');
-        if (draft.state === 'draft') break;
-        if (Date.now() >= deadline) throw new Error(`Pasted input could not be verified before Enter: ${draft.reason ?? draft.state}`);
-        await new Promise((resolve) => setTimeout(resolve, 60));
+      let inputAttempted = false;
+      try {
+        const result = await input.submit(envelope(attempt), async () => {
+          const submitting = this.db.prepare("UPDATE delivery_attempts SET status = 'submitting', execution_id = ?, generation = ?, pane = ?, submitting_at = ?, failure = NULL WHERE id = ? AND status = 'pending' AND EXISTS (SELECT 1 FROM messages WHERE messages.id = delivery_attempts.message_id AND acknowledged_at IS NULL)")
+            .run(target.executionId, target.generation, target.pane, new Date().toISOString(), attempt.id);
+          if (submitting.changes !== 1) return false;
+          await mkdir(submissions, { recursive: true, mode: 0o700 });
+          await writeFile(submission, JSON.stringify({ attemptId: attempt.id, messageId: attempt.message_id }), { mode: 0o600, flag: 'wx' });
+          return true;
+        });
+        if (result.kind === 'cancelled') return;
+        if (result.kind === 'deferred') { defer(result.reason); return; }
+        if (result.kind === 'refused') {
+          this.db.prepare("UPDATE delivery_attempts SET status = 'pending', execution_id = NULL, generation = NULL, pane = NULL, submitting_at = NULL, failure = ? WHERE id = ?")
+            .run(result.reason, attempt.id);
+          return;
+        }
+        inputAttempted = result.kind === 'entered' || result.kind === 'uncertain';
+        if (result.kind === 'failed' || result.kind === 'uncertain') throw new Error(result.reason);
+        const receiptDeadline = Date.now() + 3500;
+        for (;;) {
+          const result = this.db.prepare('SELECT status, failure FROM delivery_attempts WHERE id = ?').get(attempt.id) as { status: string; failure: string | null };
+          if (result.status === 'submitted' || result.status === 'uncertain') break;
+          if (Date.now() >= receiptDeadline) throw new Error('Enter was sent but the native prompt verification hook did not confirm this attempt');
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+      } catch (error) {
+        this.db.prepare("UPDATE delivery_attempts SET status = ?, execution_id = ?, generation = ?, pane = ?, failure = ? WHERE id = ? AND prompt_verified_at IS NULL")
+          .run(inputAttempted ? 'uncertain' : 'failed', target.executionId, target.generation, target.pane, (error as Error).message, attempt.id);
+      } finally {
+        if (!inputAttempted) await unlink(submission).catch(() => {});
       }
-      const entered = await tmux(['if-shell', '-F', '-t', target.pane, condition(draft),
-        `send-keys -t ${target.pane} Enter ; display-message -p crew-entered`, 'display-message -p crew-refused']);
-      if (entered.stdout.trim() !== 'crew-entered') throw new Error('Terminal target or cursor changed before Enter');
-      const receiptDeadline = Date.now() + 3500;
-      for (;;) {
-        const result = this.db.prepare('SELECT status, failure FROM delivery_attempts WHERE id = ?').get(attempt.id) as { status: string; failure: string | null };
-        if (result.status === 'submitted' || result.status === 'uncertain') break;
-        if (Date.now() >= receiptDeadline) throw new Error('Enter was sent but the native prompt verification hook did not confirm this attempt');
-        await new Promise((resolve) => setTimeout(resolve, 30));
-      }
-    } catch (error) {
-      this.db.prepare("UPDATE delivery_attempts SET status = ?, execution_id = ?, generation = ?, pane = ?, failure = ? WHERE id = ? AND prompt_verified_at IS NULL")
-        .run(inputAttempted ? 'uncertain' : 'failed', target.executionId, target.generation, target.pane, (error as Error).message, attempt.id);
-    } finally {
-      await tmux(['delete-buffer', '-b', buffer]).catch(() => {});
-      await unlink(path).catch(() => {});
-      if (!inputAttempted) await unlink(submission).catch(() => {});
-    }
+    });
+    if (!prepared.ready) defer(prepared.reason);
   }
 }
