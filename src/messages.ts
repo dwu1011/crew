@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { HTTPException } from 'hono/http-exception';
+import type { Crews } from './crews.js';
+import { DeliveryAttempts, type PromptSubmission } from './delivery-attempts.js';
 
 export interface MessageCaller {
   crew: string;
@@ -26,50 +28,10 @@ interface MessageRow {
 }
 
 export class Messages {
-  constructor(private db: Database.Database) {
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('005_durable_messages')) return;
-      db.exec(`CREATE TABLE messages (
-        id TEXT PRIMARY KEY, crew_id TEXT NOT NULL REFERENCES crews(id), request_id TEXT NOT NULL,
-        sender_key TEXT NOT NULL, sender_seat_id TEXT REFERENCES seats(id), sender_execution_id TEXT REFERENCES executions(id),
-        recipient_seat_id TEXT NOT NULL REFERENCES seats(id), body TEXT NOT NULL, created_at TEXT NOT NULL,
-        acknowledged_at TEXT, UNIQUE(crew_id, sender_key, request_id));
-        CREATE INDEX messages_inbox ON messages(recipient_seat_id, acknowledged_at);
-        CREATE TABLE delivery_attempts (
-          id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id),
-          execution_id TEXT REFERENCES executions(id), status TEXT NOT NULL, created_at TEXT NOT NULL, failure TEXT);
-        CREATE INDEX delivery_pending ON delivery_attempts(status);
-      `);
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('005_durable_messages', new Date().toISOString());
-    }).immediate();
-    if (!db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('007_message_receipts')) {
-      db.pragma('foreign_keys = OFF');
-      try {
-        db.transaction(() => {
-          db.exec(`CREATE TABLE messages_next (
-            id TEXT PRIMARY KEY, crew_id TEXT NOT NULL REFERENCES crews(id), request_id TEXT NOT NULL,
-            sender_key TEXT NOT NULL, sender_seat_id TEXT REFERENCES seats(id), sender_execution_id TEXT REFERENCES executions(id),
-            recipient_seat_id TEXT REFERENCES seats(id), body TEXT NOT NULL, created_at TEXT NOT NULL,
-            acknowledged_at TEXT, acknowledged_execution_id TEXT REFERENCES executions(id), reply_to TEXT REFERENCES messages(id),
-            UNIQUE(crew_id, sender_key, request_id));
-            INSERT INTO messages_next (id, crew_id, request_id, sender_key, sender_seat_id, sender_execution_id,
-              recipient_seat_id, body, created_at, acknowledged_at)
-              SELECT id, crew_id, request_id, sender_key, sender_seat_id, sender_execution_id,
-                recipient_seat_id, body, created_at, acknowledged_at FROM messages ORDER BY rowid;
-            DROP TABLE messages;
-            ALTER TABLE messages_next RENAME TO messages;
-            CREATE INDEX messages_inbox ON messages(recipient_seat_id, acknowledged_at);
-            CREATE INDEX messages_replies ON messages(reply_to);`);
-          if (db.prepare('PRAGMA foreign_key_check').all().length) throw new Error('Message migration violated foreign keys');
-          db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('007_message_receipts', new Date().toISOString());
-        }).immediate();
-      } finally { db.pragma('foreign_keys = ON'); }
-    }
-    db.transaction(() => {
-      if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('009_delivery_retry')) return;
-      db.exec("CREATE UNIQUE INDEX delivery_one_active ON delivery_attempts(message_id) WHERE status IN ('pending', 'submitting')");
-      db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('009_delivery_retry', new Date().toISOString());
-    }).immediate();
+  private attempts: DeliveryAttempts;
+
+  constructor(private db: Database.Database, crews: Crews, directory: string) {
+    this.attempts = new DeliveryAttempts(db, crews, directory);
   }
 
   private crew(caller: MessageCaller) {
@@ -105,8 +67,7 @@ export class Messages {
       this.db.prepare(`INSERT INTO messages (id, crew_id, request_id, sender_key, sender_seat_id, sender_execution_id,
         recipient_seat_id, body, created_at, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, crewId, requestId, caller.executionId ?? 'operator', caller.seatId, caller.executionId, recipientId, body, created, replyTo);
-      if (recipientId) this.db.prepare("INSERT INTO delivery_attempts (id, message_id, status, created_at) VALUES (?, ?, 'pending', ?)")
-        .run(randomUUID(), id, created);
+      if (recipientId) this.attempts.enqueue(id, created);
       return id;
     }).immediate();
     return this.show(caller, persistedId);
@@ -133,36 +94,30 @@ export class Messages {
       recipient: { kind: row.recipient_seat_id ? 'agent' : 'operator', seat: row.recipient, seatId: row.recipient_seat_id }, body: row.body, createdAt: row.created_at, acknowledgedAt: row.acknowledged_at,
       replyTo: row.reply_to, replies: this.db.prepare('SELECT id, created_at AS createdAt FROM messages WHERE reply_to = ? ORDER BY rowid').all(id),
       acknowledgment: row.acknowledged_at ? { executionId: row.acknowledged_execution_id, acknowledgedAt: row.acknowledged_at } : null,
-      deliveries: (this.db.prepare('SELECT id, execution_id, generation, pane, status, created_at, submitting_at, submitted_at, failure, prompt_verified_at, prompt_hash, native_prompt_id FROM delivery_attempts WHERE message_id = ? ORDER BY rowid').all(id) as
-        { id: string; execution_id: string | null; generation: string | null; pane: string | null; status: string; created_at: string; submitting_at: string | null; submitted_at: string | null; failure: string | null; prompt_verified_at: string | null; prompt_hash: string | null; native_prompt_id: string | null }[])
-        .map((attempt) => ({ id: attempt.id, executionId: attempt.execution_id, generation: attempt.generation, pane: attempt.pane, status: attempt.status, createdAt: attempt.created_at,
-          submittingAt: attempt.submitting_at, submittedAt: attempt.submitted_at, failure: attempt.failure,
-          promptVerification: attempt.prompt_verified_at ? { verifiedAt: attempt.prompt_verified_at, executionId: attempt.execution_id, nativePromptId: attempt.native_prompt_id, hash: attempt.prompt_hash } : null })),
+      deliveries: this.attempts.history(id),
     };
   }
 
   retry(caller: MessageCaller, id: string, allowDuplicate: boolean) {
-    this.db.transaction(() => {
-      const message = this.show(caller, id);
-      if (message.acknowledgedAt) throw new HTTPException(409, { message: 'Acknowledged messages cannot be retried' });
-      if (!message.recipient.seatId) throw new HTTPException(409, { message: 'Operator replies have no terminal delivery to retry' });
-      const latest = message.deliveries.at(-1);
-      if (!latest || !['failed', 'uncertain'].includes(latest.status))
-        throw new HTTPException(409, { message: 'Only a definite failure or uncertain delivery can be retried' });
-      if (latest.status === 'uncertain' && !allowDuplicate)
-        throw new HTTPException(409, { message: 'Uncertain delivery may already have occurred; retry requires --allow-duplicate' });
-      this.db.prepare("INSERT INTO delivery_attempts (id, message_id, status, created_at) VALUES (?, ?, 'pending', ?)")
-        .run(randomUUID(), id, new Date().toISOString());
-    }).immediate();
+    this.show(caller, id);
+    this.attempts.retry(id, allowDuplicate);
     return this.show(caller, id);
   }
 
   issues(caller: MessageCaller) {
-    const rows = this.db.prepare(`SELECT m.id FROM messages m JOIN delivery_attempts a ON a.message_id = m.id
-      WHERE m.crew_id = ? AND m.acknowledged_at IS NULL AND (? IS NULL OR m.sender_seat_id = ? OR m.recipient_seat_id = ?)
-      AND a.rowid = (SELECT MAX(rowid) FROM delivery_attempts WHERE message_id = m.id)
-      AND a.status IN ('failed', 'uncertain') ORDER BY m.rowid`).all(this.crew(caller), caller.seatId, caller.seatId, caller.seatId) as { id: string }[];
-    return rows.map((row) => this.show(caller, row.id));
+    return this.attempts.issues(this.crew(caller), caller.seatId).map((row) => this.show(caller, row.id));
+  }
+
+  start() {
+    this.attempts.start();
+  }
+
+  stop() {
+    return this.attempts.stop();
+  }
+
+  verifyPrompt(caller: Parameters<DeliveryAttempts['verifyPrompt']>[0], input: PromptSubmission & { attemptId: string }) {
+    return this.attempts.verifyPrompt(caller, input);
   }
 
   inbox(caller: MessageCaller, all: boolean) {

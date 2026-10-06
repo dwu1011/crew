@@ -1121,12 +1121,12 @@ test.each(['delivery', 'delivery-slow'] as const)('a full literal message is sub
 }, 20000);
 
 test.each([
-  ['existing draft', 'My existing draft', 'draft'],
-  ['permission dialog', '\u0010', 'interactive selection'],
-  ['selection menu', '\u0013', 'interactive selection'],
-  ['busy turn', '\u0002', 'busy'],
-  ['unknown screen', '\u0012', 'Unrecognized'],
-])('delivery defers for %s and resumes after a verified empty prompt', async (_name, input, reason) => {
+  ['existing draft', 'My existing draft', 'draft', 'My existing draft'],
+  ['permission dialog', '\u0010', 'interactive selection', 'Do you want to proceed?'],
+  ['selection menu', '\u0013', 'interactive selection', 'Choose option'],
+  ['busy turn', '\u0002', 'busy', 'esc to interrupt'],
+  ['unknown screen', '\u0012', 'Unrecognized', 'Unrecognized native screen'],
+])('delivery defers for %s and resumes after a verified empty prompt', async (_name, input, reason, screen) => {
   const { directory, state, config, binary } = await fixture('delivery');
   await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], {
     env: { ...process.env, CREW_CLAUDE_BIN: binary }, timeout: 15000,
@@ -1134,7 +1134,9 @@ test.each([
   await cli(state, 'up', config);
   await expect.poll(async () => JSON.parse((await cli(state, 'status', '--json')).stdout).status).toBe('ready');
   const seat = JSON.parse((await cli(state, 'status', '--json')).stdout).seats[0];
+  await expect.poll(async () => (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout).toContain('Claude Code fixture');
   await exec('tmux', ['-S', seat.tmux.socket, 'send-keys', '-t', seat.tmux.pane, '-l', input]);
+  await expect.poll(async () => (await exec('tmux', ['-S', seat.tmux.socket, 'capture-pane', '-p', '-t', seat.tmux.pane])).stdout).toContain(screen);
   const sent = JSON.parse((await cli(state, 'send', 'investigator', '--text', 'Wait until input is safe.', '--json')).stdout);
   await expect.poll(async () => JSON.parse((await cli(state, 'message', 'show', sent.id, '--json')).stdout).deliveries[0], { timeout: 8000 })
     .toMatchObject({ status: 'pending', failure: expect.stringContaining(reason) });
