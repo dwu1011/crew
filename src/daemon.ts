@@ -8,7 +8,6 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { processAlive } from './state.js';
 import { Crews } from './crews.js';
 import { Messages } from './messages.js';
-import { Delivery } from './delivery.js';
 import { z } from 'zod';
 import { HTTPException } from 'hono/http-exception';
 
@@ -54,10 +53,9 @@ try {
 const token = randomBytes(32).toString('hex');
 const app = new Hono();
 const crews = new Crews(db, directory);
-const messages = new Messages(db);
-const delivery = new Delivery(db, crews, directory);
+const messages = new Messages(db, crews, directory);
 await crews.reconcileAll();
-delivery.start();
+messages.start();
 let stopping = false;
 let url = '';
 function status() {
@@ -152,11 +150,7 @@ app.post('/executions/prompt', async (context) => {
   const caller = crews.whoami(executionCredential(context.req.header('Authorization')));
   const parsed = z.object({ attemptId: z.string().uuid(), sessionId: z.string(), cwd: z.string(), prompt: z.string(), nativePromptId: z.string().min(1).max(200).optional(), eventAt: z.string().datetime().optional() }).strict().safeParse(await context.req.json());
   if (!parsed.success) return context.json({ error: 'Expected delivery attempt, native session, cwd, and submitted prompt' }, 400);
-  if (caller.nativeSessionId !== parsed.data.sessionId || caller.cwd !== parsed.data.cwd) return context.json({ error: 'Native prompt identity mismatch' }, 403);
-  if (parsed.data.eventAt && Date.parse(parsed.data.eventAt) > Date.now() + 10000) return context.json({ error: 'Native event timestamp is in the future' }, 400);
-  const result = delivery.verifyPrompt(caller, parsed.data);
-  if ('firstReceipt' in result && result.firstReceipt) crews.recordActivity(caller.executionId, 'UserPromptSubmit', parsed.data.eventAt ?? new Date().toISOString());
-  return context.json(result);
+  return context.json(messages.verifyPrompt(caller, parsed.data));
 });
 app.post('/executions/ready', async (context) => {
   const body = await context.req.json();
@@ -195,7 +189,7 @@ server.on('error', (error) => {
 function shutdown() {
   if (stopping) return;
   stopping = true;
-  const delivering = delivery.stop();
+  const delivering = messages.stop();
   const drainDeadline = setTimeout(() => server.closeAllConnections(), 1000);
   drainDeadline.unref();
   server.close(async () => {
