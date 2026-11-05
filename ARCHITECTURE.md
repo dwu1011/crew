@@ -19,6 +19,7 @@ Crew exposes a CLI backed by a local HTTP daemon. The daemon records coordinatio
 | tmux and Claude input observation | [terminal.ts](src/terminal.ts), [claude-input.ts](src/claude-input.ts) |
 | Message persistence, replies, and delivery | [messages.ts](src/messages.ts), [delivery-attempts.ts](src/delivery-attempts.ts) |
 | Reusable profiles, project selection, and bundled planning roles | [profiles.ts](src/profiles.ts), [planning.ts](src/planning.ts) |
+| Per-seat skill/MCP resolution, summaries, and launch snapshots | [capabilities.ts](src/capabilities.ts) |
 
 ## Storage
 
@@ -27,6 +28,10 @@ The daemon state directory defaults to `~/.crew`; `CREW_HOME` or `--state-dir` s
 SQLite records crews, stable seats, execution generations, messages, delivery attempts, and supporting lifecycle and input evidence. Schema changes are tracked by migrations in `database.ts`. Runtime state is separate from the Git-versioned [knowledge base](docs/index.md).
 
 Profile registrations store a stable identity and canonical definition source. The bundled planning roles ship in the compiled program. A unique profile/project association identifies each project run. Executions capture their effective role and project; retired seats preserve history without appearing in the current roster.
+
+Executions also capture secret-free capability summaries in SQLite and private `capabilities.json` files. Explicit skill selections snapshot the selected directories under the execution root and expose a lazy catalog while disabling native skill/command discovery. Explicit MCP selections snapshot only selected definitions in private `mcp.json` files and use strict native configuration. Omitted selections retain unenumerated native inheritance. Resolved resources participate in the launch digest. See [capability configuration and limitations](docs/guides/operations.md#per-seat-skills-and-mcp-servers).
+
+The [capability validation record](docs/exec-plans/completed/per-seat-capabilities.md) records deterministic launch and migration checks; live model/MCP behavior was not exercised.
 
 ## Main flows
 

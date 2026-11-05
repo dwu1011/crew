@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -218,6 +218,138 @@ test('invalid role and working-directory references launch no agents', async () 
   await writeFile(config, 'name: sample\nproject: missing-project\nagents:\n  investigator:\n    runtime: claude\n    role_file: missing-role.md\n');
   await expect(cli(state, 'up', config, '--json')).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('project') });
   await expect(exec('tmux', ['-S', join(state, 'tmux.sock'), 'list-sessions'])).rejects.toThrow();
+}, 20000);
+
+test('seat capabilities filter native launches, stay lazy, and redact server secrets', async () => {
+  const { directory, state, config, binary } = await fixture();
+  const skill = join(directory, '.claude', 'skills', 'frontend');
+  await mkdir(join(skill, 'scripts'), { recursive: true });
+  await writeFile(join(skill, 'SKILL.md'), '---\nname: frontend\ndescription: Build deliberate interfaces\n---\nSKILL_BODY_ONLY_ON_DEMAND\n');
+  await writeFile(join(skill, 'scripts', 'check.sh'), '#!/bin/sh\necho original\n', { mode: 0o700 });
+  await writeFile(join(directory, 'servers.json'), JSON.stringify({ mcpServers: {
+    docs: { type: 'http', url: 'https://example.invalid/mcp', headers: { Authorization: 'SECRET_SELECTED' } },
+    search: { command: 'search-mcp', env: { TOKEN: 'SECRET_UNSELECTED' } },
+  } }));
+  await writeFile(config, 'name: sample\nproject: project with spaces\nmcp_config: servers.json\nagents:\n  frontend:\n    runtime: claude\n    role_file: role.md\n    skills: [frontend]\n    mcp_servers: [docs]\n  researcher:\n    runtime: claude\n    role_file: role.md\n    skills: []\n    mcp_servers: [search]\n  empty:\n    runtime: claude\n    role_file: role.md\n    skills: []\n    mcp_servers: []\n  inherited:\n    runtime: claude\n    role_file: role.md\n');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  const launched = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', 'sample', '--json')).stdout).status).toBe('ready');
+  for (const seat of launched.seats) {
+    const root = join(state, 'executions', seat.executionId);
+    const manifest = JSON.parse(await readFile(join(root, 'launch.json'), 'utf8'));
+    const context = await readFile(seat.contextFile, 'utf8');
+    expect(context).not.toContain('SKILL_BODY_ONLY_ON_DEMAND');
+    expect(context).not.toContain('SECRET_');
+    expect(manifest.args.includes('--disable-slash-commands')).toBe(seat.name !== 'inherited');
+    expect(manifest.args.includes('--strict-mcp-config')).toBe(seat.name !== 'inherited');
+    if (seat.name === 'inherited') {
+      expect(seat.capabilities).toEqual({ skills: { mode: 'inherited' }, mcpServers: { mode: 'inherited' } });
+      expect(context).not.toContain('# Selected skills');
+      expect(manifest.args).not.toContain('--mcp-config');
+      continue;
+    }
+    const mcpPath = manifest.args[manifest.args.indexOf('--mcp-config') + 1];
+    const servers = JSON.parse(await readFile(mcpPath, 'utf8')).mcpServers;
+    expect(Object.keys(servers)).toEqual(seat.name === 'frontend' ? ['docs'] : seat.name === 'researcher' ? ['search'] : []);
+    expect((await stat(mcpPath)).mode & 0o777).toBe(0o600);
+    expect(seat.capabilities.skills.mode).toBe('selected');
+    if (seat.name === 'frontend') {
+      expect(context).toContain('Build deliberate interfaces');
+      expect(context).toContain(join(root, 'skills', 'frontend', 'SKILL.md'));
+      expect(await readFile(join(root, 'skills', 'frontend', 'SKILL.md'), 'utf8')).toContain('SKILL_BODY_ONLY_ON_DEMAND');
+      expect((await stat(join(root, 'skills', 'frontend', 'scripts', 'check.sh'))).mode & 0o700).toBe(0o700);
+    } else expect(seat.capabilities.skills.items).toEqual([]);
+  }
+  const members = (await cli(state, 'members', '--crew', 'sample', '--json')).stdout;
+  const status = (await cli(state, 'status', '--crew', 'sample', '--json')).stdout;
+  expect(members + status).not.toContain('SECRET_');
+  expect(members + status).not.toContain('example.invalid');
+  expect(JSON.parse(members).members[0].capabilities).toEqual(launched.seats[0].capabilities);
+  expect(JSON.parse((await cli(state, 'up', config, '--json')).stdout).seats.map((s: { executionId: string }) => s.executionId))
+    .toEqual(launched.seats.map((s: { executionId: string }) => s.executionId));
+}, 30000);
+
+test('profile capability revisions preserve snapshots and history across daemon restarts', async () => {
+  const { directory, state, project, binary } = await fixture();
+  const source = join(directory, 'profile.yaml');
+  const skill = join(directory, 'design');
+  await mkdir(skill);
+  await writeFile(join(skill, 'SKILL.md'), '---\nname: design\ndescription: Design interfaces\n---\nOriginal skill.\n');
+  await writeFile(join(skill, 'reference.txt'), 'Original reference.');
+  const serverPath = join(directory, 'servers.json');
+  await writeFile(serverPath, JSON.stringify({ mcpServers: { docs: { command: 'docs-mcp', env: { TOKEN: 'OLD_SECRET' } } } }));
+  await writeFile(source, 'name: design\nmcp_config: servers.json\nagents:\n  designer:\n    runtime: claude\n    role_file: role.md\n    skills: [./design]\n    mcp_servers: [docs]\n');
+  const start = () => exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  await start();
+  const profile = JSON.parse((await cli(state, 'profile', 'register', source, '--json')).stdout);
+  expect(JSON.stringify(profile)).not.toContain('OLD_SECRET');
+  expect(profile.seats[0].capabilities.skills.items[0]).toMatchObject({ name: 'design', source: skill });
+  const first = JSON.parse((await cli(state, 'up', '--profile', 'design', '--project', project, '--json')).stdout);
+  await expect.poll(async () => JSON.parse((await cli(state, 'status', '--crew', first.name, '--json')).stdout).status).toBe('ready');
+  const old = first.seats[0];
+  const oldRoot = join(state, 'executions', old.executionId);
+  await writeFile(join(skill, 'reference.txt'), 'Revised reference.');
+  await expect(cli(state, 'up', '--profile', 'design', '--project', project)).rejects.toMatchObject({ stderr: expect.stringContaining('Stop the project run') });
+  expect(await readFile(join(oldRoot, 'skills', 'design', 'reference.txt'), 'utf8')).toBe('Original reference.');
+  expect(JSON.parse((await cli(state, 'status', '--crew', first.name, '--json')).stdout).seats[0].executionId).toBe(old.executionId);
+  await writeFile(join(skill, 'reference.txt'), 'Original reference.');
+  await writeFile(serverPath, JSON.stringify({ mcpServers: { docs: { command: 'docs-mcp', env: { TOKEN: 'NEW_SECRET' } } } }));
+  await expect(cli(state, 'up', '--profile', 'design', '--project', project)).rejects.toMatchObject({ stderr: expect.stringContaining('Stop the project run') });
+  expect(await readFile(join(oldRoot, 'mcp.json'), 'utf8')).toContain('OLD_SECRET');
+  await cli(state, 'daemon', 'stop'); await start();
+  expect(JSON.parse((await cli(state, 'status', '--crew', first.name, '--json')).stdout).seats[0].capabilities).toEqual(old.capabilities);
+  await cli(state, 'down', '--crew', first.name);
+  const revised = JSON.parse((await cli(state, 'up', '--profile', 'design', '--project', project, '--json')).stdout).seats[0];
+  expect(revised.executionId).not.toBe(old.executionId);
+  expect(revised.capabilities.mcpServers.digest).not.toBe(old.capabilities.mcpServers.digest);
+  expect(revised.history[0].capabilities).toEqual(old.capabilities);
+  expect(revised.history[1].capabilities).toEqual(revised.capabilities);
+  expect(await readFile(join(oldRoot, 'mcp.json'), 'utf8')).toContain('OLD_SECRET');
+}, 30000);
+
+test('invalid capability selections fail before creating any terminals or leaking config content', async () => {
+  const { directory, state, config } = await fixture();
+  const source = join(directory, 'profile.yaml');
+  const skill = join(directory, 'design');
+  await mkdir(skill);
+  await writeFile(join(skill, 'SKILL.md'), '---\nname: design\ndescription: Design interfaces\n---\nInstructions\n');
+  await symlink(join(directory, 'role.md'), join(skill, 'linked.txt'));
+  await writeFile(join(directory, 'servers.json'), '{"mcpServers":{"docs":{"headers":{"Authorization":"SECRET_INVALID"}}}}');
+  const base = 'name: sample\nmcp_config: servers.json\nagents:\n  investigator:\n    runtime: claude\n    role_file: role.md\n';
+  await writeFile(source, base);
+  await cli(state, 'profile', 'register', source);
+  for (const selection of ['    skills: [missing]\n', '    skills: [./design]\n', '    skills: [missing, missing]\n',
+    '    mcp_servers: [missing]\n', '    mcp_servers: [docs]\n', '    mcp_servers: [docs, docs]\n']) {
+    await writeFile(config, base.replace('name: sample\n', 'name: sample\nproject: project with spaces\n') + selection);
+    await writeFile(source, base + selection);
+    for (const args of [['up', config], ['profile', 'register', source]]) {
+      try { await cli(state, ...args); throw new Error('Expected rejection'); }
+      catch (error) {
+        expect(error).toMatchObject({ code: 1 });
+        expect((error as { stderr: string }).stderr).not.toContain('SECRET_INVALID');
+        expect((error as { stderr: string }).stderr).not.toContain('Internal daemon error');
+      }
+    }
+    const discovery = JSON.parse(await readFile(join(state, 'daemon.json'), 'utf8'));
+    const response = await fetch(`${discovery.url}/profiles/sample`, { headers: { Authorization: `Bearer ${discovery.token}` } });
+    expect(response.status).toBe(400);
+    expect(await response.text()).not.toContain('SECRET_INVALID');
+  }
+  await expect(exec('tmux', ['-S', join(state, 'tmux.sock'), 'list-sessions'])).rejects.toThrow();
+}, 30000);
+
+test('skill and MCP lists independently preserve the other capability inheritance', async () => {
+  const { state, config, binary } = await fixture();
+  await writeFile(config, 'name: sample\nproject: project with spaces\nagents:\n  skills-only:\n    runtime: claude\n    role_file: role.md\n    skills: []\n  mcp-only:\n    runtime: claude\n    role_file: role.md\n    mcp_servers: []\n');
+  await exec(process.execPath, [cliPath, '--state-dir', state, 'daemon', 'start'], { env: { ...process.env, CREW_CLAUDE_BIN: binary } });
+  const launched = JSON.parse((await cli(state, 'up', config, '--json')).stdout);
+  for (const seat of launched.seats) {
+    const manifest = JSON.parse(await readFile(join(state, 'executions', seat.executionId, 'launch.json'), 'utf8'));
+    expect(manifest.args.includes('--disable-slash-commands')).toBe(seat.name === 'skills-only');
+    expect(manifest.args.includes('--strict-mcp-config')).toBe(seat.name === 'mcp-only');
+    expect(seat.capabilities.skills.mode).toBe(seat.name === 'skills-only' ? 'selected' : 'inherited');
+    expect(seat.capabilities.mcpServers.mode).toBe(seat.name === 'mcp-only' ? 'selected' : 'inherited');
+  }
 }, 20000);
 
 test('a bundled planning profile launches separate project runs without copying configuration', async () => {

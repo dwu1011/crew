@@ -7,8 +7,9 @@ import { z } from 'zod';
 import { HTTPException } from 'hono/http-exception';
 import { agentsSchema, nameSchema, projectDirectory } from './config.js';
 import { planningRoles } from './planning.js';
+import { inheritedCapabilities, resolveCapabilities } from './capabilities.js';
 
-const schema = z.object({ name: nameSchema, agents: agentsSchema }).strict();
+const schema = z.object({ name: nameSchema, agents: agentsSchema, mcp_config: z.string().min(1).optional() }).strict();
 interface ProfileRow { id: string; name: string; source_path: string | null }
 
 export interface RunSelector { crew?: string; profile?: string; project?: string }
@@ -32,7 +33,7 @@ export class Profiles {
       if (definition.name !== profile.name) throw new Error('Registered profile name changed; register the new name explicitly');
       return definition;
     } catch (error) {
-      throw new HTTPException(400, { message: `Invalid profile: ${(error as Error).message}. Profiles contain name and agents only; project is supplied at launch.` });
+      throw new HTTPException(400, { message: `Invalid profile: ${(error as Error).message}. Profiles contain name, agents, and optional mcp_config; project is supplied at launch.` });
     }
   }
 
@@ -54,7 +55,11 @@ export class Profiles {
           if (difference === '..' || difference.startsWith(`..${sep}`) || isAbsolute(difference)) throw new HTTPException(400, { message: 'Profile working directory escapes the project' });
         }
       }
-      return { name, runtime: agent.runtime, rolePath, role, cwd, workingDirectory: agent.cwd ?? '.' };
+      let capabilities: Awaited<ReturnType<typeof resolveCapabilities>>;
+      try {
+        capabilities = await resolveCapabilities(agent, profile.source_path === null ? process.cwd() : dirname(profile.source_path), definition.mcp_config);
+      } catch (error) { throw new HTTPException(400, { message: (error as Error).message }); }
+      return { name, runtime: agent.runtime, rolePath, role, cwd, workingDirectory: agent.cwd ?? '.', capabilities };
     }));
   }
 
@@ -64,7 +69,7 @@ export class Profiles {
     try {
       sourcePath = await realpath(source);
       definition = schema.parse(parse(await readFile(sourcePath, 'utf8')));
-    } catch (error) { throw new HTTPException(400, { message: `Invalid profile: ${(error as Error).message}. Profiles contain name and agents only; project is supplied at launch.` }); }
+    } catch (error) { throw new HTTPException(400, { message: `Invalid profile: ${(error as Error).message}. Profiles contain name, agents, and optional mcp_config; project is supplied at launch.` }); }
     const existing = this.db.prepare('SELECT * FROM profiles WHERE name = ?').get(definition.name) as ProfileRow | undefined;
     if (existing && existing.source_path !== sourcePath) throw new HTTPException(409, { message: `Profile ${definition.name} is already registered from another source` });
     const profile = existing ?? { id: randomUUID(), name: definition.name, source_path: sourcePath };
@@ -85,7 +90,9 @@ export class Profiles {
   async show(name: string) {
     const profile = this.row(name);
     return { id: profile.id, name: profile.name, source: profile.source_path, builtin: profile.source_path === null,
-      projectBinding: 'supplied at launch', seats: await this.agents(profile) };
+      projectBinding: 'supplied at launch', seats: (await this.agents(profile)).map(({ capabilities, ...agent }) => ({
+        ...agent, capabilities: capabilities?.summary ?? inheritedCapabilities,
+      })) };
   }
 
   async launch(name: string, root: string) {

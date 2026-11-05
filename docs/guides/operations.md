@@ -31,9 +31,43 @@ crew down
 
 The bundled profile contains planner, architect, and critic roles that wait for a brief. Each project gets separate agents, credentials, and message history. Launching the same profile in the same canonical folder reuses its run. `--project <directory>` overrides the current folder. Project-aware commands also work from subdirectories, selecting the deepest bound project root. Use `--profile` when several profiles exist there, or `--crew <name>` to operate a run explicitly from anywhere.
 
-Register custom profiles once with `crew profile register /path/to/profile.yaml`. Their YAML contains `name` and `agents`, using the same runtime and role-file fields as legacy configurations, but omits `project`. Role files resolve relative to the profile definition; optional seat `cwd` paths resolve within the selected project. The daemon retains the source reference, so later edits are read at launch. Revised content applies only after verified crew shutdown; live instructions and historical context remain intact. Profile registrations are isolated by state directory.
+Register custom profiles once with `crew profile register /path/to/profile.yaml`. Their YAML contains `name`, `agents`, and optional `mcp_config`, using the same runtime and role-file fields as legacy configurations, but omits `project`. Role files resolve relative to the profile definition; optional seat `cwd` paths resolve within the selected project. The daemon retains the source reference, so later edits are read at launch. Revised content applies only after verified crew shutdown; live instructions and historical context remain intact. Profile registrations are isolated by state directory.
 
 HTTP operators can list/inspect/register through `GET /profiles`, `GET /profiles/:name`, and `POST /profiles` with an absolute `source`. `POST /crews/up` accepts either absolute `configPath` or `profile` plus absolute `project`. Existing status, members, and messaging interfaces accept optional `crew`, `profile`, and absolute `project` selectors. Managed credentials remain scoped to their own crew. Older HTTP callers without selectors retain their existing selection behavior.
+
+## Per-seat skills and MCP servers
+
+Both reusable profiles and legacy configurations accept optional seat `skills` and `mcp_servers` lists. For example, a reusable profile can contain:
+
+```yaml
+name: product
+mcp_config: /private/path/to/servers.json
+agents:
+  frontend:
+    runtime: claude
+    role_file: roles/frontend.md
+    skills: [frontend-design, ./skills/impeccable]
+    mcp_servers: [context7, browser]
+  researcher:
+    runtime: claude
+    role_file: roles/researcher.md
+    skills: []
+    mcp_servers: [perplexity]
+```
+
+Omitting either list preserves native inheritance for that capability. An explicit empty list selects none. These settings are independent: setting `skills: []` does not change MCP inheritance. Existing definitions without either list retain their launch behavior.
+
+Skill references identify directories containing `SKILL.md` with YAML `name` and `description` frontmatter. Explicit paths resolve relative to the profile/configuration file. Bare names search `.claude/skills/<name>` and `.agents/skills/<name>` beside that definition, then under the user's home directory, in that order. Plugin skills can be selected by an explicit directory path. Skill names must be unique lowercase letters, numbers, and hyphens, starting with a letter or number. Resources must be regular files and directories; symlinked resources are rejected. Crew does not install skills or plugins.
+
+An explicit skill list passes Claude's `--disable-slash-commands`, disabling native skill and command discovery. Crew puts only the selected names, descriptions, and instruction paths in the launch context. The agent reads instructions and references on demand from private execution snapshots. Native skill slash commands are unavailable in this mode. Frontmatter supplies the catalog's name and description; native execution directives such as `context: fork` and `allowed-tools` are not applied by file-based loading. Full skill instructions are not appended to the initial context. Resource bytes and executable bits are preserved in each execution snapshot.
+
+`mcp_config` points to a native JSON file shaped as `{"mcpServers":{"context7":{...},"browser":{...}}}`. Its path resolves relative to the definition. Each selected server must define either a stdio `command` (with optional `args` and `env`) or `type: http`/`sse` with a `url` (and optional `headers`). Keep credentials and this registry outside the knowledge base. A nonempty `mcp_servers` list requires this registry; an empty list needs no registry. Crew validates all seats before creating executions or terminals, then writes only each seat's selected definitions into a private file and passes `--strict-mcp-config --mcp-config <file>`. Other MCP configurations are excluded for that launch. Native managed policy remains authoritative and can reject startup; Crew never falls back to inherited MCP configuration.
+
+`crew profile show <name> --json` shows the current resolved selection. `crew status --json`, `crew members --json`, and managed `crew whoami --json` show the selection captured for each execution; status also retains summaries in execution history. Summaries expose skill names, descriptions, source paths, and content digests, plus MCP names and a configuration digest. They omit server commands, URLs, headers, and environment values. `inherited` means native discovery is retained and unenumerated; `null` means a historical execution predates capability recording. These summaries describe launch configuration, not successful MCP connections or native policy overrides.
+
+Selected instruction/resource contents and MCP definitions contribute to the launch digest. Edits cause a mismatch while executions are running. Stop a profile run explicitly before adopting revisions; old snapshots and history remain intact. Legacy configurations retain their existing mismatch behavior. Capability selection manages discovery and context, not filesystem access, credentials, or native tool permissions. Other native customizations and built-in tools remain governed by Claude settings.
+
+The switches are documented in Claude's [CLI reference](https://code.claude.com/docs/en/cli-reference); managed MCP restrictions are documented in [managed MCP](https://code.claude.com/docs/en/managed-mcp). Implementation was checked against local Claude Code 2.1.312 help; automated native fixtures verify launch wiring without making model requests.
 
 ## Messages and recovery
 

@@ -12,6 +12,7 @@ import { loadConfig } from './config.js';
 import { prepareAgentTerminal } from './terminal.js';
 import { ManagedExecutions, type InputOptions, type InputSession } from './managed-executions.js';
 import { Profiles } from './profiles.js';
+import { inheritedCapabilities, snapshotCapabilities } from './capabilities.js';
 
 const exec = promisify(execFile);
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -43,6 +44,7 @@ interface Execution {
   retryable: number;
   created_at: string;
   runtime_version: string | null;
+  capabilities_json: string | null;
 }
 
 export class Crews {
@@ -141,9 +143,10 @@ export class Crews {
           this.db.prepare('INSERT OR IGNORE INTO seats (id, crew_id, name, role_path, role) VALUES (?, ?, ?, ?, ?)')
             .run(agent.seatId, crewId, agent.name, agent.rolePath, agent.role);
           this.db.prepare('UPDATE seats SET role_path = ?, role = ?, retired = 0 WHERE id = ?').run(agent.rolePath, agent.role, agent.seatId);
-          this.db.prepare(`INSERT INTO executions (id, seat_id, generation, native_session_id, token_hash, status, cwd, created_at, role, role_path, project)
-            VALUES (?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?)`)
-            .run(agent.executionId, agent.seatId, agent.generation, agent.nativeSessionId, hash(agent.credential), agent.cwd, new Date().toISOString(), agent.role, agent.rolePath, config.project);
+          this.db.prepare(`INSERT INTO executions (id, seat_id, generation, native_session_id, token_hash, status, cwd, created_at, role, role_path, project, capabilities_json)
+            VALUES (?, ?, ?, ?, ?, 'launching', ?, ?, ?, ?, ?, ?)`)
+            .run(agent.executionId, agent.seatId, agent.generation, agent.nativeSessionId, hash(agent.credential), agent.cwd, new Date().toISOString(), agent.role, agent.rolePath, config.project,
+              JSON.stringify(agent.capabilities?.summary ?? inheritedCapabilities));
         }
       }).immediate();
 
@@ -159,6 +162,7 @@ export class Crews {
           this.db.prepare('UPDATE executions SET runtime_version = ? WHERE id = ?').run(version, executionId);
           const executable = binary.includes('/') ? resolve(binary) : (await exec('which', [binary], { timeout: 5000 })).stdout.trim();
           await mkdir(join(runtimeRoot, 'bin'), { recursive: true, mode: 0o700 });
+          const capabilities = await snapshotCapabilities(agent.capabilities, runtimeRoot);
           const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
           await writeFile(join(runtimeRoot, 'bin', 'crew'), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(cli)} "$@"\n`, { mode: 0o700 });
           const context = [
@@ -166,6 +170,7 @@ export class Crews {
             `# Managed identity\nCrew: ${config.name}\nSeat: ${agent.name}\nExecution: ${executionId}\nGeneration: ${generation}`,
             `# Project\nProject root: ${config.project}\nWorking directory: ${agent.cwd}`,
             ...guidance,
+            ...(capabilities.context ? [capabilities.context] : []),
             `# Crew roster\n${JSON.stringify(config.agents.map((teammate) => ({ seat: teammate.name, runtime: teammate.runtime, role: teammate.role })), null, 2)}`,
             '# Coordination\nUse `crew whoami --json` to verify your identity, `crew members --json` to inspect teammates and their roles, and `crew status --json` to inspect current execution status. Use `crew send <seat> --text <body> --json` or `--body-file <path>` to persist a message. Use `--request-id <id>` to recover the same submission after a lost response. Use `crew inbox --json` and `crew message show <id> --json` to inspect messages without acknowledging them. These commands select your crew from your managed credential. Messages are persisted and queued for terminal delivery. Inspect delivery status: pending waits for safe input, submitted records native prompt verification of the saved delivery envelope, and uncertain may have affected input and will not retry automatically. Eligible pending work resumes after daemon restart. Inspect crew status for deliveryIssues and full attempt history. Explicit `crew message retry <id>` creates a new attempt for a definite failure; uncertain outcomes require `--allow-duplicate`. Acknowledged messages cannot be retried. Prompt verification does not acknowledge receipt or prove task completion. Use `crew ack <message-id> --json` to acknowledge receipt. Use `crew reply <message-id> --text <body> --json` (or --body-file) to send a linked reply and acknowledge the original atomically. Only the current recipient execution can acknowledge or reply. Operator-directed replies remain inspectable in the inbox. Only one agent should write project files at a time. Your role instructions do not alter native tool permissions.',
           ].join('\n\n');
@@ -179,7 +184,7 @@ export class Crews {
           const manifestPath = join(runtimeRoot, 'launch.json');
           await writeFile(manifestPath, JSON.stringify({
             executable, args: ['--session-id', nativeSessionId, '--append-system-prompt-file', contextPath, '--settings', settingsPath,
-              ...(agent.cwd === config.project ? [] : ['--add-dir', config.project])],
+              ...capabilities.args, ...(agent.cwd === config.project ? [] : ['--add-dir', config.project])],
             env: { CREW_HOME: this.directory, CREW_EXECUTION_TOKEN: credential, CREW_EXECUTION_ID: executionId,
               CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
               CREW_NAME: config.name, CREW_SEAT: agent.name, CREW_GENERATION: generation, CREW_EXECUTION_ROOT: runtimeRoot, PATH: `${join(runtimeRoot, 'bin')}:${process.env.PATH ?? ''}` },
@@ -330,9 +335,11 @@ export class Crews {
       name: seat.name, seatId: seat.seat_id, role: seat.role, roleFile: seat.role_path, runtime: 'claude', nativeVersion: seat.runtime_version, cwd: seat.cwd,
       executionId: seat.id, generation: seat.generation, nativeSessionId: seat.conversation_session_id ?? seat.native_session_id,
       status: seat.state === 'active' ? seat.status : seat.state, failure: seat.failure, contextFile: seat.context_path, activity: this.activity(seat.id) ?? null,
-      history: (this.db.prepare('SELECT id, generation, native_session_id, status, state, failure, created_at, role, role_path, project, cwd, context_path FROM executions WHERE seat_id = ? ORDER BY rowid').all(seat.seat_id) as (Execution & { role: string | null })[])
+      capabilities: seat.capabilities_json ? JSON.parse(seat.capabilities_json) : null,
+      history: (this.db.prepare('SELECT id, generation, native_session_id, status, state, failure, created_at, role, role_path, project, cwd, context_path, capabilities_json FROM executions WHERE seat_id = ? ORDER BY rowid').all(seat.seat_id) as (Execution & { role: string | null })[])
         .map((execution) => ({ executionId: execution.id, generation: execution.generation, nativeSessionId: execution.native_session_id, status: execution.state === 'active' ? execution.status : execution.state, nativeStatus: execution.status, failure: execution.failure, createdAt: execution.created_at,
-          role: execution.role, roleFile: execution.role_path, project: execution.project, cwd: execution.cwd, contextFile: execution.context_path })),
+          role: execution.role, roleFile: execution.role_path, project: execution.project, cwd: execution.cwd, contextFile: execution.context_path,
+          capabilities: execution.capabilities_json ? JSON.parse(execution.capabilities_json) : null })),
       tmux: seat.tmux_session ? { socket: this.socket, session: seat.tmux_session, pane: seat.tmux_pane } : null,
     });
     return { id: crew.id, name: crew.name, project: crew.project,
@@ -373,7 +380,8 @@ export class Crews {
     const execution = this.execution(credential);
     return { crew: execution.crew, crewId: execution.crew_id, seat: execution.seat, seatId: execution.seat_id,
       executionId: execution.id, generation: execution.generation, nativeSessionId: execution.conversation_session_id ?? execution.native_session_id,
-      runtime: 'claude', cwd: execution.cwd, status: execution.status };
+      runtime: 'claude', cwd: execution.cwd, status: execution.status,
+      capabilities: execution.capabilities_json ? JSON.parse(execution.capabilities_json) : null };
   }
 
   async sessionStarted(credential: string, sessionId: string, cwd: string, source: 'clear' | 'resume') {

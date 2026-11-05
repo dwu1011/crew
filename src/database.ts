@@ -194,5 +194,11 @@ export function openDatabase(path: string, bootId: string) {
     db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('014_delivery_tasks', new Date().toISOString());
   }).immediate();
 
+  db.transaction(() => {
+    if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('015_seat_capabilities')) return;
+    db.exec('ALTER TABLE executions ADD COLUMN capabilities_json TEXT');
+    db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('015_seat_capabilities', new Date().toISOString());
+  }).immediate();
+
   return db;
 }

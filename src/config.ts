@@ -2,17 +2,21 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
+import { resolveCapabilities } from './capabilities.js';
 
 export const nameSchema = z.string().regex(/^[a-z][a-z0-9-]{0,63}$/);
 export const agentsSchema = z.record(nameSchema, z.object({
   runtime: z.literal('claude'),
   role_file: z.string().min(1),
   cwd: z.string().min(1).optional(),
+  skills: z.array(z.string().min(1)).refine((items) => new Set(items).size === items.length, 'Duplicate skills').optional(),
+  mcp_servers: z.array(z.string().min(1)).refine((items) => new Set(items).size === items.length, 'Duplicate MCP servers').optional(),
 }).strict()).refine((agents) => Object.keys(agents).length > 0, 'A crew requires at least one seat');
 const schema = z.object({
   name: nameSchema,
   project: z.string().min(1),
   agents: agentsSchema,
+  mcp_config: z.string().min(1).optional(),
 }).strict();
 
 export async function projectDirectory(reference: string) {
@@ -54,7 +58,8 @@ export async function loadConfig(configPath: string) {
     } catch {
       throw new Error(`Invalid role_file for ${name}: ${agent.role_file} must reference a readable, nonempty file`);
     }
-    agents.push({ name, runtime: agent.runtime, cwd, role, rolePath });
+    const capabilities = await resolveCapabilities(agent, base, config.mcp_config);
+    agents.push({ name, runtime: agent.runtime, cwd, role, rolePath, capabilities });
   }
   return { name: config.name, project, agents, configPath };
 }
