@@ -12,12 +12,44 @@ import { attachCrew, attachSession, detachCrew } from './terminal.js';
 
 const program = new Command().name('crew').description('Local agent crew coordinator')
   .option('--state-dir <directory>', 'Daemon state directory', process.env.CREW_HOME ?? join(homedir(), '.crew'));
+interface RunOptions { crew?: string; profile?: string; project?: string }
+function selection(options: RunOptions) {
+  return { crew: options.crew, profile: options.profile,
+    project: options.project ? resolve(options.project) : process.env.CREW_EXECUTION_TOKEN ? undefined : process.cwd() };
+}
+function selectionQuery(options: RunOptions) {
+  return new URLSearchParams(Object.entries(selection(options)).filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+function runOptions(command: Command) {
+  return command.option('--crew <name>', 'Crew name; overrides project selection')
+    .option('--profile <name>', 'Select a reusable profile run')
+    .option('--project <directory>', 'Select a project; defaults to the current directory');
+}
 const daemon = program.command('daemon').description('Manage the local coordinator');
-for (const mode of ['send', 'reply'] as const) program.command(mode === 'send' ? 'send <seat>' : 'reply <id>').description(mode === 'send' ? 'Persist a message and queue terminal delivery' : 'Reply and acknowledge the original as its recipient')
-  .option('--crew <name>', 'Crew name').option('--text <body>', 'Literal message body')
+const profile = program.command('profile').description('Register and inspect reusable role definitions');
+profile.command('register <source>').option('--json', 'Machine-readable output')
+  .action(async (source: string, options: { json?: boolean }) => {
+    const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
+    await start(directory);
+    const result = await request(directory, '/profiles', { source: resolve(source) }, process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
+profile.command('list').option('--json', 'Machine-readable output')
+  .action(async (options: { json?: boolean }) => {
+    const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
+    await start(directory);
+    console.log(JSON.stringify(await request(directory, '/profiles', undefined, process.env.CREW_EXECUTION_TOKEN), null, options.json ? undefined : 2));
+  });
+profile.command('show <name>').option('--json', 'Machine-readable output')
+  .action(async (name: string, options: { json?: boolean }) => {
+    const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
+    await start(directory);
+    console.log(JSON.stringify(await request(directory, `/profiles/${encodeURIComponent(name)}`, undefined, process.env.CREW_EXECUTION_TOKEN), null, options.json ? undefined : 2));
+  });
+for (const mode of ['send', 'reply'] as const) runOptions(program.command(mode === 'send' ? 'send <seat>' : 'reply <id>').description(mode === 'send' ? 'Persist a message and queue terminal delivery' : 'Reply and acknowledge the original as its recipient')).option('--text <body>', 'Literal message body')
   .option('--body-file <path>', 'Read body from a file; - reads standard input')
   .option('--request-id <id>', 'Reuse this identifier to recover a submission').option('--json', 'Machine-readable output')
-  .action(async (seat: string, options: { crew?: string; text?: string; bodyFile?: string; requestId?: string; json?: boolean }) => {
+  .action(async (seat: string, options: RunOptions & { text?: string; bodyFile?: string; requestId?: string; json?: boolean }) => {
     if ((options.text !== undefined) === (options.bodyFile !== undefined)) throw new Error('Provide exactly one of --text or --body-file.');
     let body = options.text;
     if (options.bodyFile === '-') {
@@ -28,72 +60,113 @@ for (const mode of ['send', 'reply'] as const) program.command(mode === 'send' ?
     const requestId = options.requestId ?? randomUUID();
     console.error(`Submission request ID: ${requestId}. Reuse --request-id ${requestId} to recover this submission.`);
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), mode === 'send' ? '/messages' : `/messages/${encodeURIComponent(seat)}/reply`,
-      { crew: options.crew, ...(mode === 'send' ? { recipient: seat } : {}), body, requestId }, process.env.CREW_EXECUTION_TOKEN);
+      { ...selection(options), ...(mode === 'send' ? { recipient: seat } : {}), body, requestId }, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
-program.command('ack <id>').description('Acknowledge receipt as the current recipient execution')
-  .option('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
-  .action(async (id: string, options: { crew?: string; json?: boolean }) => {
+runOptions(program.command('ack <id>').description('Acknowledge receipt as the current recipient execution')).option('--json', 'Machine-readable output')
+  .action(async (id: string, options: RunOptions & { json?: boolean }) => {
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}/ack`,
-      { crew: options.crew }, process.env.CREW_EXECUTION_TOKEN);
+      selection(options), process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
-program.command('inbox').description('Inspect incoming messages without acknowledging them')
-  .option('--crew <name>', 'Crew name').option('--all', 'Include acknowledged history').option('--json', 'Machine-readable output')
-  .action(async (options: { crew?: string; all?: boolean; json?: boolean }) => {
-    const query = new URLSearchParams({ ...(options.crew ? { crew: options.crew } : {}), ...(options.all ? { all: 'true' } : {}) });
+runOptions(program.command('inbox').description('Inspect incoming messages without acknowledging them')).option('--all', 'Include acknowledged history').option('--json', 'Machine-readable output')
+  .action(async (options: RunOptions & { all?: boolean; json?: boolean }) => {
+    const query = selectionQuery(options);
+    if (options.all) query.set('all', 'true');
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/inbox?${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
 const messageCommands = program.command('message').description('Inspect and retry persisted messages');
-messageCommands.command('show <id>')
-  .option('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
-  .action(async (id: string, options: { crew?: string; json?: boolean }) => {
-    const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
+runOptions(messageCommands.command('clear').description('Delete this crew’s messages and delivery attempts without stopping its agents')).option('--json', 'Machine-readable output')
+  .action(async (options: RunOptions & { json?: boolean }) => {
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), '/messages/clear', selection(options), process.env.CREW_EXECUTION_TOKEN);
+    console.log(JSON.stringify(result, null, options.json ? undefined : 2));
+  });
+runOptions(messageCommands.command('show <id>')).option('--json', 'Machine-readable output')
+  .action(async (id: string, options: RunOptions & { json?: boolean }) => {
+    const query = `?${selectionQuery(options)}`;
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
-messageCommands.command('retry <id>').description('Create a new attempt for failed or explicitly accepted uncertain delivery')
-  .option('--crew <name>', 'Crew name').option('--allow-duplicate', 'Accept that uncertain delivery may produce a duplicate')
+runOptions(messageCommands.command('retry <id>').description('Create a new attempt for failed or explicitly accepted uncertain delivery')).option('--allow-duplicate', 'Accept that uncertain delivery may produce a duplicate')
   .option('--json', 'Machine-readable output')
-  .action(async (id: string, options: { crew?: string; allowDuplicate?: boolean; json?: boolean }) => {
+  .action(async (id: string, options: RunOptions & { allowDuplicate?: boolean; json?: boolean }) => {
     const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `/messages/${encodeURIComponent(id)}/retry`,
-      { crew: options.crew, allowDuplicate: options.allowDuplicate ?? false }, process.env.CREW_EXECUTION_TOKEN);
+      { ...selection(options), allowDuplicate: options.allowDuplicate ?? false }, process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
-program.command('up <configuration>').description('Launch configured Claude Code seats')
-  .option('--json', 'Machine-readable output').action(async (configuration: string, options: { json?: boolean }) => {
+for (const [name, path] of [['feature', '/features'], ['task', '/tasks']] as const) {
+  const commands = program.command(name).description(`Manage durable ${name} records`);
+  runOptions(commands.command('list')).option('--feature <id>', 'Filter tasks by feature').option('--json', 'Machine-readable output')
+    .action(async (options: RunOptions & { feature?: string; json?: boolean }) => {
+      const query = selectionQuery(options);
+      if (options.feature) query.set('featureId', options.feature);
+      console.log(JSON.stringify(await request(resolve(program.opts<{ stateDir: string }>().stateDir), `${path}?${query}`, undefined,
+        process.env.CREW_EXECUTION_TOKEN), null, options.json ? undefined : 2));
+    });
+  runOptions(commands.command('show <id>')).option('--json', 'Machine-readable output')
+    .action(async (id: string, options: RunOptions & { json?: boolean }) => {
+      console.log(JSON.stringify(await request(resolve(program.opts<{ stateDir: string }>().stateDir), `${path}/${encodeURIComponent(id)}?${selectionQuery(options)}`,
+        undefined, process.env.CREW_EXECUTION_TOKEN), null, options.json ? undefined : 2));
+    });
+  runOptions(commands.command('create')).requiredOption('--input-file <path>', 'JSON feature or task contract')
+    .option('--request-id <id>', 'Recover this mutation with the same identifier').option('--json', 'Machine-readable output')
+    .action(async (options: RunOptions & { inputFile: string; requestId?: string; json?: boolean }) => {
+      const input = JSON.parse(await readFile(options.inputFile, 'utf8'));
+      const requestId = options.requestId ?? randomUUID();
+      console.error(`Mutation request ID: ${requestId}. Reuse --request-id ${requestId} to recover this mutation.`);
+      console.log(JSON.stringify(await request(resolve(program.opts<{ stateDir: string }>().stateDir), path,
+        { ...selection(options), input, requestId }, process.env.CREW_EXECUTION_TOKEN), null, options.json ? undefined : 2));
+    });
+  for (const action of ['ready', 'pause', 'resume', 'cancel', 'grant'] as const) {
+    if ((name === 'feature' && action === 'ready') || (name === 'task' && action === 'grant')) continue;
+    const command = runOptions(commands.command(`${action} <id>`))
+      .requiredOption('--expected-version <number>', 'Version returned by show')
+      .requiredOption('--reason <text>', 'Reason for this change')
+      .option('--request-id <id>', 'Recover this mutation with the same identifier').option('--json', 'Machine-readable output');
+    if (action === 'grant') command.requiredOption('--execution <id>', 'Current execution to grant planning authority').option('--revoke', 'Revoke its planning authority');
+    command.action(async (id: string, options: RunOptions & { expectedVersion: string; reason: string; requestId?: string; json?: boolean; execution?: string; revoke?: boolean }) => {
+      const requestId = options.requestId ?? randomUUID();
+      console.error(`Mutation request ID: ${requestId}. Reuse --request-id ${requestId} to recover this mutation.`);
+      console.log(JSON.stringify(await request(resolve(program.opts<{ stateDir: string }>().stateDir), `${path}/${encodeURIComponent(id)}/${action}`,
+        { ...selection(options), requestId, expectedVersion: Number(options.expectedVersion), reason: options.reason,
+          ...(action === 'grant' ? { input: { executionId: options.execution, enabled: !options.revoke } } : {}) }, process.env.CREW_EXECUTION_TOKEN),
+        null, options.json ? undefined : 2));
+    });
+  }
+}
+program.command('up [configuration]').description('Launch configured Claude Code seats or a reusable profile')
+  .option('--profile <name>', 'Reusable profile name').option('--project <directory>', 'Project root; defaults to the current directory')
+  .option('--json', 'Machine-readable output').action(async (configuration: string | undefined, options: { profile?: string; project?: string; json?: boolean }) => {
+    if ((configuration !== undefined) === (options.profile !== undefined) || (configuration && options.project)) throw new Error('Provide either a configuration path or --profile <name> with optional --project <directory>.');
     const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
     await start(directory);
-    const result = await request(directory, '/crews/up', { configPath: resolve(configuration) });
+    const result = await request(directory, '/crews/up', configuration ? { configPath: resolve(configuration) } : { profile: options.profile, project: resolve(options.project ?? process.cwd()) }, process.env.CREW_EXECUTION_TOKEN);
     if (options.json) console.log(JSON.stringify(result));
     else console.log(JSON.stringify(result, null, 2));
     if (result.seats.some((seat: { status: string }) => seat.status === 'failed')) process.exitCode = 1;
   });
-program.command('down').description('Stop one crew while retaining execution history')
-  .requiredOption('--crew <name>', 'Crew name').option('--json', 'Machine-readable output')
-  .action(async (options: { crew: string; json?: boolean }) => {
-    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), '/crews/down', { crew: options.crew }, process.env.CREW_EXECUTION_TOKEN);
+runOptions(program.command('down').description('Stop one crew and clear its messages; retain execution history')).option('--json', 'Machine-readable output')
+  .action(async (options: RunOptions & { json?: boolean }) => {
+    const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), '/crews/down', selection(options), process.env.CREW_EXECUTION_TOKEN);
     console.log(JSON.stringify(result, null, options.json ? undefined : 2));
   });
 for (const [name, path, description] of [
   ['status', '/crews', 'Inspect a configured crew'],
   ['members', '/members', 'Discover crew members and their roles'],
 ]) {
-  program.command(name).description(description)
-    .option('--crew <name>', 'Crew name; managed executions use their own crew').option('--json', 'Machine-readable output')
-    .action(async (options: { crew?: string; json?: boolean }) => {
-      const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
+  runOptions(program.command(name).description(description)).option('--json', 'Machine-readable output')
+    .action(async (options: RunOptions & { json?: boolean }) => {
+      const query = `?${selectionQuery(options)}`;
       const result = await request(resolve(program.opts<{ stateDir: string }>().stateDir), `${path}${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
       console.log(JSON.stringify(result, null, options.json ? undefined : 2));
       if (name === 'status' && ['failed', 'unknown'].includes(result.status)) process.exitCode = 1;
     });
 }
 for (const name of ['attach', 'detach']) {
-  program.command(`${name} [seat]`).description(`${name === 'attach' ? 'Enter' : 'Disconnect from'} a seat or the entire crew`)
-    .option('--crew <name>', 'Crew name; required when multiple crews exist')
-    .action(async (seatName: string | undefined, options: { crew?: string }) => {
-      const query = options.crew ? `?crew=${encodeURIComponent(options.crew)}` : '';
+  runOptions(program.command(`${name} [seat]`).description(`${name === 'attach' ? 'Enter' : 'Disconnect from'} a seat or the entire crew`))
+    .action(async (seatName: string | undefined, options: RunOptions) => {
+      const query = `?${selectionQuery(options)}`;
       const directory = resolve(program.opts<{ stateDir: string }>().stateDir);
       const crew = await request(directory, `/crews${query}`, undefined, process.env.CREW_EXECUTION_TOKEN);
       if (!seatName) {

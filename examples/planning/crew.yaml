@@ -1,0 +1,12 @@
+name: planning-crew
+project: .
+agents:
+  planner:
+    runtime: claude
+    role_file: planner.md
+  architect:
+    runtime: claude
+    role_file: architect.md
+  critic:
+    runtime: claude
+    role_file: critic.md

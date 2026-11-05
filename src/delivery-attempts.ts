@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { HTTPException } from 'hono/http-exception';
 import { join } from 'node:path';
 import type { Crews } from './crews.js';
+import { DaemonRequestError } from './client.js';
 
 interface Pending {
   id: string; message_id: string; recipient_seat_id: string; sender: string | null; body: string;
@@ -41,8 +42,10 @@ export async function verifyProtectedPrompt(root: string, input: PromptSubmissio
       const result = await verify({ ...input, attemptId });
       if (!result.verified) blockedReason = result.reason;
     }
-  } catch {
-    blockedReason = 'Crew could not verify this delivery; inspect its attempt before retrying.';
+  } catch (error) {
+    const detail = error instanceof DaemonRequestError ? ` (HTTP ${error.status}: ${error.message})`
+      : error instanceof Error && error.name === 'TimeoutError' ? ' (daemon request timed out)' : '';
+    blockedReason = `Crew could not verify this delivery${detail}; inspect its attempt before retrying.`;
   } finally {
     if (protectedPath) await unlink(protectedPath).catch(() => {});
   }
@@ -103,7 +106,8 @@ export class DeliveryAttempts {
       if (!attempt) throw new HTTPException(404, { message: 'Delivery attempt not found in this execution' });
       const wrapped = input.prompt.match(/^\n*<pasted_content id="([^"\n]+)">\n([\s\S]*)\n<\/pasted_content id="\1">\n*$/);
       const prompt = wrapped?.[2] ?? input.prompt;
-      if (prompt !== envelope(attempt)) {
+      const expected = envelope(attempt);
+      if (prompt !== expected && prompt !== expected.trimEnd()) {
         this.db.prepare("UPDATE delivery_attempts SET status = 'uncertain', failure = ? WHERE id = ? AND status = 'submitting'")
           .run('Native submitted prompt did not match the persisted delivery; hook blocked processing', attempt.id);
         return { verified: false, reason: 'Submitted prompt does not match the saved Crew delivery.' };

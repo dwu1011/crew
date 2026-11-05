@@ -1,3 +1,5 @@
+> Retention amendment, 2026-10-08: at the user’s request, successful `crew down` now clears the selected crew’s messages and delivery attempts while preserving execution history. Operator-only `crew message clear` clears saved messages without stopping agents. Failed shutdown and daemon restart preserve messages. This supersedes message-retention requirements across explicit crew shutdown below; historical launch context remains retained. See [operations](docs/guides/operations.md).
+
 # Crew MVP: local agent crews with durable terminal messaging
 
 Status: specification draft with an approved nine-ticket breakdown. The project workspace is crew; an external issue tracker is not configured. The user confirmed CLI acceptance testing plus direct daemon HTTP testing and requires manual validation after every ticket. `crew` is the working product and command name.

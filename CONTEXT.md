@@ -8,6 +8,12 @@ Crew coordinates agents occupying named seats and records their messages and del
 A group of seats working in a project.
 _Avoid_: Team, rig
 
+**Profile**:
+A reusable definition of seats, roles, and runtimes. It is registered independently of a project folder.
+
+**Project run**:
+A persistent Crew bound to a Profile and a canonical project folder. Repeated launch commands reuse that Crew; distinct projects retain distinct executions and coordination history.
+
 **Seat**:
 A stable, named place in a crew with a defined role. Different executions can occupy the same seat over time.
 _Avoid_: Agent identity

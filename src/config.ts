@@ -3,16 +3,27 @@ import { dirname, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
 
-const name = z.string().regex(/^[a-z][a-z0-9-]{0,63}$/);
+export const nameSchema = z.string().regex(/^[a-z][a-z0-9-]{0,63}$/);
+export const agentsSchema = z.record(nameSchema, z.object({
+  runtime: z.literal('claude'),
+  role_file: z.string().min(1),
+  cwd: z.string().min(1).optional(),
+}).strict()).refine((agents) => Object.keys(agents).length > 0, 'A crew requires at least one seat');
 const schema = z.object({
-  name,
+  name: nameSchema,
   project: z.string().min(1),
-  agents: z.record(name, z.object({
-    runtime: z.literal('claude'),
-    role_file: z.string().min(1),
-    cwd: z.string().min(1).optional(),
-  }).strict()).refine((agents) => Object.keys(agents).length > 0, 'A crew requires at least one seat'),
+  agents: agentsSchema,
 }).strict();
+
+export async function projectDirectory(reference: string) {
+  try {
+    const path = await realpath(reference);
+    if (!(await stat(path)).isDirectory()) throw new Error('not a directory');
+    return path;
+  } catch {
+    throw new Error(`Invalid project: ${reference} must reference an existing directory`);
+  }
+}
 
 export async function loadConfig(configPath: string) {
   let config: z.infer<typeof schema>;
