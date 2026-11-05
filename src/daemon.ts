@@ -1,5 +1,5 @@
 import { serve } from '@hono/node-server';
-import Database from 'better-sqlite3';
+import { openDatabase } from './database.js';
 import { Hono } from 'hono';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
@@ -8,7 +8,6 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { processAlive } from './state.js';
 import { Crews } from './crews.js';
 import { Messages } from './messages.js';
-import { Delivery } from './delivery.js';
 import { z } from 'zod';
 import { HTTPException } from 'hono/http-exception';
 
@@ -16,48 +15,15 @@ process.umask(0o077);
 const directory = resolve(process.argv[2]);
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const databasePath = join(directory, 'crew.sqlite');
-const db = new Database(databasePath);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)');
-db.transaction(() => {
-  if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('001_daemon_lifecycle')) return;
-  db.exec(`CREATE TABLE daemon_lifecycle (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    instance_id TEXT NOT NULL,
-    pid INTEGER,
-    boot_id TEXT,
-    started_at TEXT,
-    stopped_at TEXT,
-    boot_count INTEGER NOT NULL DEFAULT 0
-  )`);
-  db.prepare('INSERT INTO daemon_lifecycle (singleton, instance_id) VALUES (1, ?)').run(randomUUID());
-  db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
-    .run('001_daemon_lifecycle', new Date().toISOString());
-}).immediate();
-
 const bootId = randomUUID();
-try {
-  db.transaction(() => {
-    const owner = db.prepare('SELECT pid FROM daemon_lifecycle WHERE singleton = 1').get() as { pid: number | null };
-    if (owner.pid !== null && processAlive(owner.pid)) {
-      throw new Error(`Daemon PID ${owner.pid} still exists; refusing to replace a live or unresponsive instance.`);
-    }
-    db.prepare(`UPDATE daemon_lifecycle SET pid = ?, boot_id = ?, started_at = ?, stopped_at = NULL,
-      boot_count = boot_count + 1 WHERE singleton = 1`).run(process.pid, bootId, new Date().toISOString());
-  }).immediate();
-} catch (error) {
-  db.close();
-  throw error;
-}
+const db = openDatabase(databasePath, bootId);
 
 const token = randomBytes(32).toString('hex');
 const app = new Hono();
 const crews = new Crews(db, directory);
-const messages = new Messages(db);
-const delivery = new Delivery(db, crews, directory);
+const messages = new Messages(db, crews, directory);
 await crews.reconcileAll();
-delivery.start();
+messages.start();
 let stopping = false;
 let url = '';
 function status() {
@@ -152,11 +118,7 @@ app.post('/executions/prompt', async (context) => {
   const caller = crews.whoami(executionCredential(context.req.header('Authorization')));
   const parsed = z.object({ attemptId: z.string().uuid(), sessionId: z.string(), cwd: z.string(), prompt: z.string(), nativePromptId: z.string().min(1).max(200).optional(), eventAt: z.string().datetime().optional() }).strict().safeParse(await context.req.json());
   if (!parsed.success) return context.json({ error: 'Expected delivery attempt, native session, cwd, and submitted prompt' }, 400);
-  if (caller.nativeSessionId !== parsed.data.sessionId || caller.cwd !== parsed.data.cwd) return context.json({ error: 'Native prompt identity mismatch' }, 403);
-  if (parsed.data.eventAt && Date.parse(parsed.data.eventAt) > Date.now() + 10000) return context.json({ error: 'Native event timestamp is in the future' }, 400);
-  const result = delivery.verifyPrompt(caller, parsed.data);
-  if ('firstReceipt' in result && result.firstReceipt) crews.recordActivity(caller.executionId, 'UserPromptSubmit', parsed.data.eventAt ?? new Date().toISOString());
-  return context.json(result);
+  return context.json(messages.verifyPrompt(caller, parsed.data));
 });
 app.post('/executions/ready', async (context) => {
   const body = await context.req.json();
@@ -195,7 +157,7 @@ server.on('error', (error) => {
 function shutdown() {
   if (stopping) return;
   stopping = true;
-  const delivering = delivery.stop();
+  const delivering = messages.stop();
   const drainDeadline = setTimeout(() => server.closeAllConnections(), 1000);
   drainDeadline.unref();
   server.close(async () => {

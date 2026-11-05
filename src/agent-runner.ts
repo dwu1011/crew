@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { readFile, readdir } from 'node:fs/promises';
-import { writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { writeFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { processIdentity } from './process-identity.js';
 import { request } from './client.js';
@@ -17,29 +17,14 @@ if (process.argv[2] === '--hook') {
   const hookEvent = event.hook_event_name ?? 'SessionStart';
   const eventAt = new Date().toISOString();
   let blockedReason: string | undefined;
-  let protectedPath: string | undefined;
   let managedPrompt = false;
   if (hookEvent === 'UserPromptSubmit') {
-    try {
-      let attemptId = event.prompt.match(/\[crew message=[0-9a-f-]{36} attempt=([0-9a-f-]{36})\]/)?.[1];
-      const submissions = join(root, 'submissions');
-      const files = await readdir(submissions).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') return [];
-        throw error;
-      });
-      const file = attemptId ? files.find((file) => file === `${attemptId}.json`) : files[0];
-      if (file) {
-        protectedPath = join(submissions, file);
-        attemptId = file.replace(/\.json$/, '');
-      }
-      if (attemptId) {
-        managedPrompt = true;
-        const result = await report('/executions/prompt', { attemptId, sessionId: event.session_id, cwd: event.cwd, prompt: event.prompt, nativePromptId: event.prompt_id, eventAt });
-        if (!result.verified) blockedReason = result.reason;
-      }
-    } catch {
-      blockedReason = 'Crew could not verify this delivery; inspect its attempt before retrying.';
-    }
+    const { verifyProtectedPrompt } = await import('./delivery-attempts.js');
+    const result = await verifyProtectedPrompt(root,
+      { sessionId: event.session_id, cwd: event.cwd, prompt: event.prompt, nativePromptId: event.prompt_id, eventAt },
+      (submission) => report('/executions/prompt', submission));
+    managedPrompt = result.managed;
+    blockedReason = result.blockedReason;
   } else if (hookEvent === 'SessionStart') {
     let contents: string;
     const deadline = Date.now() + 3000;
@@ -56,9 +41,6 @@ if (process.argv[2] === '--hook') {
     if (receipt.nativeSessionId !== event.session_id || receipt.cwd !== event.cwd) throw new Error('Native startup identity mismatch');
     writeFileSync(join(root, 'ready.json'), JSON.stringify({ generation: receipt.generation, sessionId: event.session_id, cwd: event.cwd, submissionProtocol: 1 }), { mode: 0o600 });
     await report('/executions/ready', { sessionId: event.session_id, cwd: event.cwd });
-  }
-  if (protectedPath) {
-    try { unlinkSync(protectedPath); } catch {}
   }
   if (blockedReason) console.log(JSON.stringify({ decision: 'block', reason: blockedReason, hookSpecificOutput: { hookEventName: 'UserPromptSubmit', suppressOriginalPrompt: true } }));
   else if (!managedPrompt) await report('/executions/activity', { event: hookEvent, eventAt, sessionId: event.session_id, cwd: event.cwd, toolName: event.tool_name }).catch(() => {});
