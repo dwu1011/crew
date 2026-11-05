@@ -141,5 +141,64 @@ export function openDatabase(path: string, bootId: string) {
       event TEXT NOT NULL, state TEXT NOT NULL, event_at TEXT NOT NULL, received_at TEXT NOT NULL)`);
     db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('011_runtime_activity', new Date().toISOString());
   }).immediate();
+  db.transaction(() => {
+    if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('012_project_runs')) return;
+    db.exec(`CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, source_path TEXT);
+      ALTER TABLE crews ADD COLUMN profile_id TEXT REFERENCES profiles(id);
+      CREATE UNIQUE INDEX crew_project_run ON crews(profile_id, project) WHERE profile_id IS NOT NULL;
+      ALTER TABLE seats ADD COLUMN retired INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE executions ADD COLUMN role TEXT;
+      ALTER TABLE executions ADD COLUMN role_path TEXT;
+      ALTER TABLE executions ADD COLUMN project TEXT;
+      UPDATE executions SET role = (SELECT role FROM seats WHERE id = executions.seat_id),
+        role_path = (SELECT role_path FROM seats WHERE id = executions.seat_id),
+        project = (SELECT c.project FROM crews c JOIN seats s ON s.crew_id = c.id WHERE s.id = executions.seat_id);`);
+    db.prepare('INSERT INTO profiles (id, name, source_path) VALUES (?, ?, NULL)').run('builtin:planning', 'planning');
+    db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('012_project_runs', new Date().toISOString());
+  }).immediate();
+  db.transaction(() => {
+    if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('013_native_conversations')) return;
+    db.exec('ALTER TABLE executions ADD COLUMN conversation_session_id TEXT');
+    db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('013_native_conversations', new Date().toISOString());
+  }).immediate();
+
+  db.transaction(() => {
+    if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('014_delivery_tasks')) return;
+    db.exec(`CREATE TABLE features (
+        id TEXT PRIMARY KEY, crew_id TEXT NOT NULL REFERENCES crews(id), title TEXT NOT NULL, goal TEXT NOT NULL,
+        planner_seat_id TEXT NOT NULL REFERENCES seats(id), phase TEXT NOT NULL DEFAULT 'investigating',
+        control TEXT NOT NULL DEFAULT 'active' CHECK(control IN ('active', 'paused', 'cancelled')),
+        version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX features_crew ON features(crew_id);
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES features(id), owner_seat_id TEXT NOT NULL REFERENCES seats(id),
+        title TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('implementation', 'investigation', 'planning')),
+        contract TEXT NOT NULL, contract_revision INTEGER NOT NULL DEFAULT 1,
+        state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft', 'ready', 'implementing', 'validating', 'verified', 'integrated', 'accepted', 'cancelled', 'superseded')),
+        control TEXT NOT NULL DEFAULT 'active' CHECK(control IN ('active', 'paused')),
+        version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX tasks_feature ON tasks(feature_id);
+      CREATE TABLE planning_grants (
+        feature_id TEXT NOT NULL REFERENCES features(id), execution_id TEXT NOT NULL REFERENCES executions(id),
+        PRIMARY KEY(feature_id, execution_id));
+      CREATE TABLE work_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, crew_id TEXT NOT NULL REFERENCES crews(id),
+        feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT REFERENCES tasks(id),
+        actor_execution_id TEXT REFERENCES executions(id), request_id TEXT NOT NULL, operation TEXT NOT NULL,
+        reason TEXT NOT NULL, previous TEXT, result TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE INDEX work_events_feature ON work_events(feature_id, sequence);
+      CREATE INDEX work_events_task ON work_events(task_id, sequence);
+      CREATE TABLE work_requests (
+        crew_id TEXT NOT NULL REFERENCES crews(id), actor_key TEXT NOT NULL, request_id TEXT NOT NULL,
+        payload TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(crew_id, actor_key, request_id));`);
+    db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('014_delivery_tasks', new Date().toISOString());
+  }).immediate();
+
+  db.transaction(() => {
+    if (db.prepare('SELECT name FROM schema_migrations WHERE name = ?').get('015_seat_capabilities')) return;
+    db.exec('ALTER TABLE executions ADD COLUMN capabilities_json TEXT');
+    db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('015_seat_capabilities', new Date().toISOString());
+  }).immediate();
+
   return db;
 }

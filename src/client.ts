@@ -1,5 +1,9 @@
 import { readDiscovery } from './state.js';
 
+export class DaemonRequestError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 export async function request(directory: string, path: string, body?: unknown, credential?: string, timeoutMs = 15000) {
   const discovery = await readDiscovery(directory);
   if (!discovery) throw new Error('Daemon is not running. Start it with crew daemon start.');
@@ -10,6 +14,6 @@ export async function request(directory: string, path: string, body?: unknown, c
     signal: AbortSignal.timeout(timeoutMs),
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error ?? `Daemon request failed: HTTP ${response.status}`);
+  if (!response.ok) throw new DaemonRequestError(response.status, result.error ?? `Daemon request failed: HTTP ${response.status}`);
   return result;
 }

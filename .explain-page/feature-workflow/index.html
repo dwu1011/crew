@@ -1,0 +1,167 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Crew — From feature request to release</title><script src="https://cdn.tailwindcss.com"></script><style>
+    :root { color-scheme:light; font-family:system-ui,sans-serif; color:#0f172a; background:#fafaf9; line-height:1.6; }
+    * { box-sizing:border-box; }
+    body { margin:0; }
+    a { color:#4338ca; text-underline-offset:3px; }
+    :focus-visible { outline:3px solid #4f46e5; outline-offset:4px; }
+    .skip { position:absolute; top:-100px; left:16px; padding:10px; background:white; z-index:10; }
+    .skip:focus { top:12px; }
+    .page { max-width:1024px; margin:auto; padding:48px 24px; }
+    .page > * + * { margin-top:48px; }
+    nav { display:flex; flex-wrap:wrap; gap:8px 24px; }
+    h1,h2,h3 { line-height:1.2; letter-spacing:-.025em; }
+    h1 { font-size:clamp(2.1rem,5vw,3.4rem); margin:12px 0 20px; }
+    h2 { font-size:1.65rem; margin:0 0 24px; }
+    h3 { font-size:1.1rem; margin:0 0 16px; }
+    p,li { max-width:72ch; overflow-wrap:anywhere; }
+    section { scroll-margin-top:24px; }
+    .card { border:1px solid #e2e8f0; border-radius:8px; background:white; padding:24px; }
+    .pair { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:24px; }
+    .diagram { min-height:320px; display:flex; flex-direction:column; justify-content:center; gap:16px; }
+    .label { font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .module { border:1px solid #94a3b8; border-radius:4px; padding:12px; text-align:center; }
+    .deep { background:linear-gradient(135deg,#0f172a,#1e293b); color:white; border:4px solid #0f172a; }
+    .seam { border-top:1px dashed #94a3b8; }
+    .leak { color:#dc2626; stroke:#dc2626; }
+    .callout { padding:16px 20px; border-left:4px solid #4f46e5; background:#eef2ff; }
+    .inference { border-color:#d97706; background:#fffbeb; }
+    .table-wrap { max-width:100%; overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; }
+    caption { text-align:left; margin-bottom:12px; color:#475569; }
+    th,td { text-align:left; vertical-align:top; padding:12px; border-bottom:1px solid #e2e8f0; min-width:140px; }
+    details { border:1px solid #e2e8f0; border-radius:8px; background:white; }
+    summary { cursor:pointer; font-weight:600; padding:16px 20px; }
+    .detail-body { padding:0 20px 20px; }
+    code,pre { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:.88em; }
+    code { overflow-wrap:anywhere; }
+    pre { overflow-x:auto; padding:16px; background:#f5f5f4; border-radius:4px; }
+    .mermaid { background:transparent; margin:0; }
+    svg { max-width:100%; height:auto; }
+    @media(max-width:640px) { .page { padding:32px 20px; } .pair { grid-template-columns:1fr; } .card { padding:20px; } }
+    @media print { :root { background:white; font-size:11pt; } .page { padding:0; max-width:none; } nav,.skip { display:none; } details::details-content { content-visibility:visible; } details > .detail-body { display:block!important; } .card,details,tr { break-inside:avoid; } }
+
+.hero-title {max-width:780px;font-size:clamp(2.5rem,6vw,4.6rem);font-family:Georgia,serif;font-weight:400;line-height:1.05}
+.intro {font-size:1.15rem;color:#475569;max-width:64ch}.eyebrow{color:#4338ca;font-weight:650}.page{max-width:1200px}.page>*+*{margin-top:56px}
+nav{padding-top:20px;border-top:1px solid #e2e8f0;margin-top:28px}h2{font-family:Georgia,serif;font-weight:400;font-size:2rem}.number{color:#6366f1;font:12px system-ui;letter-spacing:.1em;display:block;margin-bottom:12px}
+.mermaid{white-space:pre-wrap}.graph{overflow-x:auto;padding:20px 0}.graph svg{display:block;margin:auto;max-width:none!important;width:100%;height:auto}.main-graph svg{min-width:740px}.small-graph svg{min-width:430px}.caption{color:#475569;font-size:.95rem;border-top:1px solid #e2e8f0;padding-top:16px}.triple{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.route{border-top:3px solid #6366f1}.route p{font-size:.95rem}.route .label{color:#4338ca}.muted{color:#64748b}.stack{display:grid;gap:12px}.stack div{padding:16px 20px;background:#f1f5f9;border-left:3px solid #94a3b8}.stack strong{display:block}.wide{max-width:none}.pill{display:inline-block;border:1px solid #c7d2fe;background:#eef2ff;color:#3730a3;padding:4px 10px;border-radius:99px;font-size:12px}.source{margin-top:16px}li+li{margin-top:8px}summary:hover{background:#f8fafc}footer{border-top:1px solid #e2e8f0;padding-top:24px;color:#64748b;font-size:.85rem}
+@media(max-width:760px){.triple{grid-template-columns:1fr}.page{padding:28px 16px}.card{padding:18px}.page>*+*{margin-top:36px}.hero-title{font-size:2.8rem}.graph{margin:0 -4px}h2{font-size:1.7rem}}@media print{.graph svg{min-width:0!important;max-width:100%!important}.source{display:none}}
+.mermaid .label{font-size:15px;text-transform:none;letter-spacing:normal} h2{font-size:2rem!important} h3{font-size:1.1rem!important} .main-graph svg{max-width:960px!important} </style><script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';mermaid.initialize({startOnLoad:true,theme:'neutral',securityLevel:'strict',flowchart:{curve:'basis',htmlLabels:true},themeVariables:{fontFamily:'system-ui, sans-serif',fontSize:'15px'}});</script></head><body><a class="skip" href="#main">Skip to explanation</a><main id="main" class="page">
+<header><p class="label eyebrow">Crew / A proposed operating model</p><h1 class="hero-title">One goal.<br>The right crew for the work.</h1><p class="intro">A central planner turns your request into owned, verifiable tasks. Small changes take a short route. Larger features get investigation, reviewed specs and groups of agents working toward one release.</p><span class="pill">Design proposal · not implemented</span><nav aria-label="Sections"><a href="#workflow">Feature workflow</a><a href="#routes">Choose the route</a><a href="#tasks">Task lifecycle</a><a href="#groups">Agent groups</a><a href="#storage">Durable state</a></nav></header>
+<section id="workflow"><span class="number">01 / THE WHOLE JOURNEY</span><h2>Plan only as much as the feature needs.</h2><article class="card"><h3>From request to a verified deployment</h3><div class="graph main-graph"><pre class="mermaid">flowchart TD
+    G[&quot;Your feature request&quot;] --&gt; P[&quot;Central planner&lt;br/&gt;Inspect context, scope, uncertainty and impact&quot;]
+    P --&gt; Q{&quot;Missing product intent?&quot;}
+    Q --&gt;|Yes| H[&quot;Ask you one focused question&quot;]
+    H --&gt; P
+    Q --&gt;|No| R{&quot;Choose a route&quot;}
+    R --&gt;|Small and understood| S[&quot;One issue&lt;br/&gt;Acceptance criteria inside the issue&quot;]
+    R --&gt;|Several connected changes| M[&quot;Brief spec + task breakdown&lt;br/&gt;Focused planning review&quot;]
+    R --&gt;|Broad or uncertain| L[&quot;Independent investigations&lt;br/&gt;Spec + design review + milestones&quot;]
+    L --&gt; M
+    S --&gt; A[&quot;Assign a worker and independent validator&quot;]
+    M --&gt; B[&quot;Assign task groups&lt;br/&gt;Dependencies + workspace ownership&quot;]
+    A --&gt; T[&quot;Execute task lifecycle&lt;br/&gt;Implement → validate → repair as needed&quot;]
+    B --&gt; T
+    T --&gt; I[&quot;Integrate a coherent release&lt;br/&gt;Check combined behavior&quot;]
+    I --&gt; C{&quot;Release checks pass?&quot;}
+    C --&gt;|No| F[&quot;Create repair work&lt;br/&gt;Replan if assumptions changed&quot;]
+    F --&gt; T
+    C --&gt;|Yes| D[&quot;Merge + deploy tested revision&quot;]
+    D --&gt; V{&quot;Deployed behavior verified?&quot;}
+    V --&gt;|Yes| E[&quot;Complete&lt;br/&gt;Outcome + evidence reported to you&quot;]
+    V --&gt;|No| X[&quot;Recover service as appropriate&lt;br/&gt;Record failure + repair work&quot;]
+    X --&gt; F
+    classDef core fill:#0f172a,color:#fff,stroke:#0f172a;
+    classDef route fill:#eef2ff,color:#312e81,stroke:#a5b4fc;
+    classDef human fill:#fffbeb,color:#78350f,stroke:#fbbf24;
+    class P,T,I,D,E core;
+    class S,M,L,A,B route;
+    class H human;</pre></div><p class="caption">The planner chooses the route and consults you only when product intent is missing. Every route converges on owned tasks, independent validation, integration and deployment verification. Failed checks produce repair work. On narrow screens, scroll the diagram horizontally.</p><details class="source"><summary>Read or copy the Mermaid source</summary><pre>flowchart TD
+    G[&quot;Your feature request&quot;] --&gt; P[&quot;Central planner&lt;br/&gt;Inspect context, scope, uncertainty and impact&quot;]
+    P --&gt; Q{&quot;Missing product intent?&quot;}
+    Q --&gt;|Yes| H[&quot;Ask you one focused question&quot;]
+    H --&gt; P
+    Q --&gt;|No| R{&quot;Choose a route&quot;}
+    R --&gt;|Small and understood| S[&quot;One issue&lt;br/&gt;Acceptance criteria inside the issue&quot;]
+    R --&gt;|Several connected changes| M[&quot;Brief spec + task breakdown&lt;br/&gt;Focused planning review&quot;]
+    R --&gt;|Broad or uncertain| L[&quot;Independent investigations&lt;br/&gt;Spec + design review + milestones&quot;]
+    L --&gt; M
+    S --&gt; A[&quot;Assign a worker and independent validator&quot;]
+    M --&gt; B[&quot;Assign task groups&lt;br/&gt;Dependencies + workspace ownership&quot;]
+    A --&gt; T[&quot;Execute task lifecycle&lt;br/&gt;Implement → validate → repair as needed&quot;]
+    B --&gt; T
+    T --&gt; I[&quot;Integrate a coherent release&lt;br/&gt;Check combined behavior&quot;]
+    I --&gt; C{&quot;Release checks pass?&quot;}
+    C --&gt;|No| F[&quot;Create repair work&lt;br/&gt;Replan if assumptions changed&quot;]
+    F --&gt; T
+    C --&gt;|Yes| D[&quot;Merge + deploy tested revision&quot;]
+    D --&gt; V{&quot;Deployed behavior verified?&quot;}
+    V --&gt;|Yes| E[&quot;Complete&lt;br/&gt;Outcome + evidence reported to you&quot;]
+    V --&gt;|No| X[&quot;Recover service as appropriate&lt;br/&gt;Record failure + repair work&quot;]
+    X --&gt; F
+    classDef core fill:#0f172a,color:#fff,stroke:#0f172a;
+    classDef route fill:#eef2ff,color:#312e81,stroke:#a5b4fc;
+    classDef human fill:#fffbeb,color:#78350f,stroke:#fbbf24;
+    class P,T,I,D,E core;
+    class S,M,L,A,B route;
+    class H human;</pre></details></article><aside class="callout" style="margin-top:20px"><strong>Autonomy with consistent completion rules.</strong><p>Planning depth, task count and group size vary. A small issue can contain its entire spec. Independent verification and evidence of the released outcome remain required; their scope scales with the change.</p></aside></section>
+<section id="routes"><span class="number">02 / PROPORTIONAL PROCESS</span><h2>Three routes, chosen by judgment.</h2><div class="triple">
+<article class="card route"><p class="label">Small / clear</p><h3>Add a sort option</h3><p>Existing patterns, localized behavior, clear expected result.</p><p><strong>Artifacts:</strong> One issue with acceptance criteria and a verification approach.</p><p><strong>Participants:</strong> Planner for triage, one worker, one independent validator.</p><p class="muted">No separate design document. A focused regression check and affected user journey may provide the evidence.</p></article>
+<article class="card route"><p class="label">Connected / understood</p><h3>Add team invitations</h3><p>Several layers and contracts must agree.</p><p><strong>Artifacts:</strong> Brief spec, reviewed task breakdown, dependencies.</p><p><strong>Participants:</strong> Planner, relevant design reviewer, workers and validators; integration ownership is explicit.</p><p class="muted">Split work only where it can be built and tested independently.</p></article>
+<article class="card route"><p class="label">Broad / uncertain</p><h3>Add organization isolation</h3><p>Permissions, storage and existing behavior interact across the application.</p><p><strong>Artifacts:</strong> Investigations, versioned spec, design review, task graph and release milestones.</p><p><strong>Participants:</strong> Planner, relevant specialists, several task groups and independent integration validation.</p><p class="muted">Resolve consequential uncertainty before dependent implementation starts.</p></article></div><p class="muted">Illustrative classifications, not fixed rules. A one-line permission change can need more scrutiny than a large cosmetic update. The planner records its routing reason and can expand the process when new evidence appears.</p></section>
+<section id="tasks"><span class="number">03 / THE ENFORCED LOOP</span><h2>Every task has an owner and an exit condition.</h2><article class="card"><div class="graph small-graph"><pre class="mermaid">flowchart TD
+    R[&quot;Ready&lt;br/&gt;Contract + dependencies available&quot;] --&gt;|Atomic claim| W[&quot;Implementing&lt;br/&gt;One execution owns this attempt&quot;]
+    W --&gt;|Revision + evidence| V[&quot;Validating&lt;br/&gt;Independent reviewer and probes&quot;]
+    V --&gt;|Criteria satisfied| OK[&quot;Verified&lt;br/&gt;Bound to spec and code revision&quot;]
+    V --&gt;|Reproducible finding| W
+    OK --&gt; I[&quot;Integrated&lt;br/&gt;Combined checks passed&quot;]
+    I --&gt;|Integration defect| W
+    W -.-&gt;|Cannot proceed| B[&quot;Blocked&lt;br/&gt;Reason + next action recorded&quot;]
+    V -.-&gt; B
+    B --&gt;|Resolved and reassigned| R
+    classDef core fill:#0f172a,color:#fff,stroke:#0f172a;
+    classDef soft fill:#eef2ff,color:#312e81,stroke:#a5b4fc;
+    class OK,I core;
+    class R,W,V soft;</pre></div><p class="caption">Workers submit work for validation. Validators return reproducible failures or record a pass for the reviewed revision. Blocked work keeps its handoff and resumes after the blocker is resolved. Integration can uncover defects and reopen affected work.</p><details class="source"><summary>Read or copy the Mermaid source</summary><pre>flowchart TD
+    R[&quot;Ready&lt;br/&gt;Contract + dependencies available&quot;] --&gt;|Atomic claim| W[&quot;Implementing&lt;br/&gt;One execution owns this attempt&quot;]
+    W --&gt;|Revision + evidence| V[&quot;Validating&lt;br/&gt;Independent reviewer and probes&quot;]
+    V --&gt;|Criteria satisfied| OK[&quot;Verified&lt;br/&gt;Bound to spec and code revision&quot;]
+    V --&gt;|Reproducible finding| W
+    OK --&gt; I[&quot;Integrated&lt;br/&gt;Combined checks passed&quot;]
+    I --&gt;|Integration defect| W
+    W -.-&gt;|Cannot proceed| B[&quot;Blocked&lt;br/&gt;Reason + next action recorded&quot;]
+    V -.-&gt; B
+    B --&gt;|Resolved and reassigned| R
+    classDef core fill:#0f172a,color:#fff,stroke:#0f172a;
+    classDef soft fill:#eef2ff,color:#312e81,stroke:#a5b4fc;
+    class OK,I core;
+    class R,W,V soft;</pre></details></article><div class="pair" style="margin-top:24px"><div class="card"><h3>A task carries its own context</h3><p>Goal, scope, spec revision, acceptance criteria, dependencies, current owner, branch, evidence and next action. A replacement agent can resume from the record.</p></div><div class="card"><h3>Evidence controls advancement</h3><p>The daemon validates claims and transitions. A worker cannot approve its own work. Code or contract changes invalidate affected verification. Repeated failed attempts trigger diagnosis or replanning.</p></div></div><p class="muted">“Integrated” finishes a task’s implementation flow. The feature remains open until its release is verified. A single-task change still gets a proportionate integration check.</p></section>
+<section id="groups"><span class="number">04 / DIFFERENT MINDS, SHARED OUTCOME</span><h2>The planner assigns responsibilities, not a crowd.</h2><article class="card"><h3>Example: a larger team-invitations feature</h3><div class="graph small-graph"><pre class="mermaid">flowchart TD
+    P[&quot;Central planner&lt;br/&gt;Owns goal, task graph and routing&quot;] --&gt; A[&quot;Invitation group&lt;br/&gt;Worker + validator&quot;]
+    P --&gt; B[&quot;Access-control group&lt;br/&gt;Worker + validator&quot;]
+    P --&gt; C[&quot;User-interface group&lt;br/&gt;Worker + validator&quot;]
+    A &lt;--&gt;|Agreed interface + findings| C
+    B &lt;--&gt;|Permission contract| C
+    A --&gt; I[&quot;Integration responsibility&lt;br/&gt;Verify invite → accept → access journey&quot;]
+    B --&gt; I
+    C --&gt; I
+    I --&gt; P
+    classDef core fill:#0f172a,color:#fff,stroke:#0f172a;
+    classDef soft fill:#eef2ff,color:#312e81,stroke:#a5b4fc;
+    class P,I core;
+    class A,B,C soft;</pre></div><p class="caption">The central planner owns the overall outcome. Temporary groups own bounded tasks and communicate through explicit interfaces. Their combined work is checked as one user journey. These are responsibilities; they need not all be permanent seats.</p><details class="source"><summary>Read or copy the Mermaid source</summary><pre>flowchart TD
+    P[&quot;Central planner&lt;br/&gt;Owns goal, task graph and routing&quot;] --&gt; A[&quot;Invitation group&lt;br/&gt;Worker + validator&quot;]
+    P --&gt; B[&quot;Access-control group&lt;br/&gt;Worker + validator&quot;]
+    P --&gt; C[&quot;User-interface group&lt;br/&gt;Worker + validator&quot;]
+    A &lt;--&gt;|Agreed interface + findings| C
+    B &lt;--&gt;|Permission contract| C
+    A --&gt; I[&quot;Integration responsibility&lt;br/&gt;Verify invite → accept → access journey&quot;]
+    B --&gt; I
+    C --&gt; I
+    I --&gt; P
+    classDef core fill:#0f172a,color:#fff,stroke:#0f172a;
+    classDef soft fill:#eef2ff,color:#312e81,stroke:#a5b4fc;
+    class P,I core;
+    class A,B,C soft;</pre></details></article><div class="triple" style="margin-top:24px"><article class="card"><h3>Explore independently</h3><p>For consequential choices, investigators form initial conclusions separately. The planner compares evidence and commissions a focused experiment when opinions conflict.</p></article><article class="card"><h3>Delegate with a contract</h3><p>A group receives an outcome, task scope, dependencies and acceptance criteria. One owner coordinates it. Specialists join for specific questions; the group ends when its work is complete.</p></article><article class="card"><h3>Validate independently</h3><p>A validator derives checks from the spec before reading the worker’s success narrative. Different perspectives improve coverage when they bring separate reasoning and concrete probes.</p></article></div><aside class="callout" style="margin-top:20px"><strong>Central planning does not require central micromanagement.</strong><p>Workers can resolve local implementation choices and request specialist help. Changes to product intent or acceptance criteria return to the planner for a recorded revision and independent review. Ask you when the decision depends on your preference.</p></aside></section>
+<section id="storage"><span class="number">05 / WHAT SURVIVES THE CONVERSATION</span><h2>The board is a view of durable work.</h2><div class="pair"><article class="card"><h3>Proposed storage in Crew</h3><div class="stack"><div><strong>SQLite · coordination truth</strong>Features, tasks, attempts, claims, dependencies, reviews, releases and transition history.</div><div><strong>Versioned artifacts · detailed context</strong>Specs, decisions and test evidence, referenced by revision from task records.</div><div><strong>Messages · notifications and discussion</strong>Tell agents what changed. Losing a notification does not erase the task.</div></div></article><article class="card"><h3>Each transition leaves a record</h3><p><code>task · from → to · actor · time · reason · spec revision · code revision · evidence</code></p><p>State updates and transition records commit together. Claims are exclusive and belong to an execution; recovery fences off a stale execution before assigning a replacement.</p><p>Task records survive crew shutdown independently of the existing policy that clears messages. The kanban board shows current state, blockers, ownership and evidence.</p></article></div></section>
+<section id="boundaries"><span class="number">06 / CURRENT FOUNDATION → PROPOSED EXTENSION</span><h2>What exists, and what this adds.</h2><div class="pair"><article class="card"><p class="label">Current Crew</p><p>Named seats, managed Claude Code executions, reusable profiles, project runs, durable messaging and delivery recovery.</p></article><article class="card"><p class="label">Proposed next layer</p><p>Feature intake, adaptive planning, task claims, temporary groups, independent review gates, isolated workspaces, integration and autonomous releases.</p></article></div><details style="margin-top:24px"><summary>Relationship to your kanban plugin and source notes</summary><div class="detail-body"><p>The plugin supplies the starting ideas: claimable issues, acceptance contracts, independent validation, rework, worktrees and milestone integration. Crew would add autonomous specification, daemon-enforced actor rules, durable execution ownership and release completion.</p><p>The plugin’s “done” can mean a validated PR exists. This proposal tracks integration and deployment separately. Group assignment, routing rules and milestone release batching are proposed design choices, not implemented contracts.</p><ul><li><code>ARCHITECTURE.md</code> — current daemon, SQLite, seats and execution flows.</li><li><code>CONTEXT.md</code> — existing Crew vocabulary.</li><li><code>crew-project-runs-spec.md</code> — current profiles and project boundaries.</li><li><code>docs/exec-plans/active/project-runs.md</code> — implementation evidence and remaining native validation limit.</li><li>Kanban plugin 2.4.0: <code>references/data-model.md</code>, <code>skills/plan</code>, <code>skills/factory</code>, <code>skills/validate</code> and <code>skills/integrate</code>.</li><li>This conversation — autonomous operation, selective human decisions and proportional task routing.</li></ul><p>No project behavior is changed by this explainer. The diagrams describe the proposed design.</p></div></details></section>
+<footer>Crew / Feature workflow proposal · 5 November 2026<br>Single-file explainer. Diagrams and utility styling load from CDNs; captions and Mermaid source remain readable without them.</footer></main></body></html>

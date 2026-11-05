@@ -83,7 +83,7 @@ test('a human can start, inspect, and stop a loopback daemon', async () => {
 test('restart preserves database identity and migrations while creating a new boot', async () => {
   const directory = await home();
   const first = JSON.parse((await cli(directory, 'start', '--json')).stdout);
-  expect(first.database.migrations).toEqual([{ name: '001_daemon_lifecycle' }, { name: '002_single_seat' }, { name: '003_seat_roles' }, { name: '004_crew_lifecycle' }, { name: '005_durable_messages' }, { name: '006_terminal_delivery' }, { name: '007_message_receipts' }, { name: '009_delivery_retry' }, { name: '010_prompt_verification' }, { name: '011_runtime_activity' }]);
+  expect(first.database.migrations).toEqual([{ name: '001_daemon_lifecycle' }, { name: '002_single_seat' }, { name: '003_seat_roles' }, { name: '004_crew_lifecycle' }, { name: '005_durable_messages' }, { name: '006_terminal_delivery' }, { name: '007_message_receipts' }, { name: '009_delivery_retry' }, { name: '010_prompt_verification' }, { name: '011_runtime_activity' }, { name: '012_project_runs' }, { name: '013_native_conversations' }, { name: '014_delivery_tasks' }, { name: '015_seat_capabilities' }]);
   await cli(directory, 'stop');
   expect(JSON.parse((await cli(directory, 'stop', '--json')).stdout).status).toBe('stopped');
   await expect(cli(directory, 'status', '--json')).rejects.toMatchObject({ code: 1, stdout: '{"status":"stopped"}\n' });
@@ -152,11 +152,12 @@ test.each([5, 7])('startup upgrades historical schema %s without losing messages
 
   const started = JSON.parse((await cli(directory, 'start', '--json')).stdout);
   expect(started.database).toMatchObject({ instanceId, bootCount: 5 });
-  expect(started.database.migrations).toHaveLength(10);
+  expect(started.database.migrations).toHaveLength(14);
   const discovery = JSON.parse(await readFile(join(directory, 'daemon.json'), 'utf8'));
   const headers = { Authorization: `Bearer ${discovery.token}` };
   const crew = await (await fetch(`${started.url}/crews/historical`, { headers })).json();
-  expect(crew).toMatchObject({ status: 'stopped', seats: [{ seatId, executionId, role: 'Historical role', nativeVersion: null, activity: null }] });
+  expect(crew).toMatchObject({ status: 'stopped', seats: [{ seatId, executionId, role: 'Historical role', nativeVersion: null, activity: null,
+    capabilities: null, history: [{ executionId, capabilities: null }] }] });
   const message = await (await fetch(`${started.url}/messages/${messageId}?crew=historical`, { headers })).json();
   expect(message).toMatchObject({ id: messageId, body: 'Historical message', createdAt,
     deliveries: [{ id: failedAttempt, status: 'failed', failure: 'Historical failure', promptVerification: null },

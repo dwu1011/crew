@@ -13,6 +13,7 @@ interface ExecutionIdentity {
   id: string;
   generation: string;
   native_session_id: string;
+  conversation_session_id: string | null;
   cwd: string;
   status: string;
   tmux_pane: string | null;
@@ -82,7 +83,7 @@ export class ManagedExecutions {
     let ready = execution.status === 'ready';
     try {
       const marker = JSON.parse(await readFile(join(this.directory, 'executions', execution.id, 'ready.json'), 'utf8'));
-      ready ||= marker.generation === execution.generation && marker.sessionId === execution.native_session_id && marker.cwd === execution.cwd;
+      ready ||= marker.generation === execution.generation && marker.sessionId === (execution.conversation_session_id ?? execution.native_session_id) && marker.cwd === execution.cwd;
     } catch { /* A live process can still be waiting for native startup. */ }
     return { ownership: 'owned', ready, receipt, reason: null };
   }
@@ -95,15 +96,15 @@ export class ManagedExecutions {
     if (observed.ownership !== 'owned' || !observed.ready || observed.reason)
       return { target: null, reason: observed.reason ?? 'Recipient process is unverified' };
     const ready = JSON.parse(await readFile(join(this.directory, 'executions', execution.id, 'ready.json'), 'utf8').catch(() => '{}'));
-    if (ready.submissionProtocol !== 1 || ready.generation !== execution.generation || ready.sessionId !== execution.native_session_id || ready.cwd !== execution.cwd)
+    if (ready.submissionProtocol !== 1 || ready.generation !== execution.generation || ready.sessionId !== (execution.conversation_session_id ?? execution.native_session_id) || ready.cwd !== execution.cwd)
       return { target: null, reason: 'Execution has no verified prompt hook; stop and relaunch this crew to install submission verification' };
     return { target: { executionId: execution.id, generation: execution.generation, seatId, pane: execution.tmux_pane,
-      session: `crew-${execution.id}`, runnerPid: observed.receipt!.runnerPid, activity: this.activity(execution.id) }, reason: null };
+      conversationSessionId: execution.conversation_session_id ?? execution.native_session_id, session: `crew-${execution.id}`, runnerPid: observed.receipt!.runnerPid, activity: this.activity(execution.id) }, reason: null };
   }
 
-  private currentTarget(target: { executionId: string; generation: string; pane: string }) {
-    return !!this.db.prepare("SELECT id FROM executions WHERE id = ? AND generation = ? AND tmux_pane = ? AND state = 'active' AND status = 'ready'")
-      .get(target.executionId, target.generation, target.pane);
+  private currentTarget(target: { executionId: string; generation: string; pane: string; conversationSessionId: string }) {
+    return !!this.db.prepare("SELECT id FROM executions WHERE id = ? AND generation = ? AND tmux_pane = ? AND state = 'active' AND status = 'ready' AND COALESCE(conversation_session_id, native_session_id) = ?")
+      .get(target.executionId, target.generation, target.pane, target.conversationSessionId);
   }
 
   async withInput<T>(seatId: string, options: InputOptions, operation: (input: InputSession) => Promise<T>) {

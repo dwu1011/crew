@@ -10,6 +10,8 @@ import { Crews } from './crews.js';
 import { Messages } from './messages.js';
 import { z } from 'zod';
 import { HTTPException } from 'hono/http-exception';
+import { Profiles, type RunSelector } from './profiles.js';
+import { Work, featureInputSchema, taskInputSchema, grantInputSchema, mutationSchema, createRequestSchema } from './work.js';
 
 process.umask(0o077);
 const directory = resolve(process.argv[2]);
@@ -21,6 +23,8 @@ const db = openDatabase(databasePath, bootId);
 const token = randomBytes(32).toString('hex');
 const app = new Hono();
 const crews = new Crews(db, directory);
+const profiles = new Profiles(db);
+const work = new Work(db);
 const messages = new Messages(db, crews, directory);
 await crews.reconcileAll();
 messages.start();
@@ -47,9 +51,28 @@ app.onError((error, context) => {
 app.post('/crews/up', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
-  const body = await context.req.json();
-  if (typeof body?.configPath !== 'string' || !isAbsolute(body.configPath)) return context.json({ error: 'configPath must be an absolute path' }, 400);
-  return context.json(await crews.launch(body.configPath));
+  const parsed = z.union([
+    z.object({ configPath: z.string().refine(isAbsolute, 'configPath must be an absolute path') }).strict(),
+    z.object({ profile: z.string().min(1), project: z.string().refine(isAbsolute, 'project must be an absolute path') }).strict(),
+  ]).safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Provide either an absolute configPath or a profile and absolute project path' }, 400);
+  const body = parsed.data;
+  return context.json(await ('configPath' in body ? crews.launch(body.configPath) : crews.launchProfile(body.profile, body.project)));
+});
+app.get('/profiles', (context) => {
+  if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
+  return context.json(profiles.list());
+});
+app.get('/profiles/:name', async (context) => {
+  if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
+  return context.json(await profiles.show(context.req.param('name')));
+});
+app.post('/profiles', async (context) => {
+  if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ source: z.string().refine(isAbsolute) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'source must be an absolute profile definition path' }, 400);
+  return context.json(await profiles.register(parsed.data.source));
 });
 app.get('/crews/:name', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
@@ -57,54 +80,115 @@ app.get('/crews/:name', async (context) => {
   return context.json({ ...await crews.status(caller.crew), deliveryIssues: messages.issues(caller) });
 });
 const executionCredential = (header: string | undefined) => header?.startsWith('Bearer ') ? header.slice(7) : '';
-function selectedCaller(header: string | undefined, requested: string | undefined) {
-  if (header === `Bearer ${token}`) return { crew: crews.select(requested), seatId: null, executionId: null };
-  const caller = crews.whoami(executionCredential(header));
-  if (requested && requested !== caller.crew) throw new HTTPException(403, { message: 'Managed executions can only inspect their own crew' });
-  return { crew: caller.crew, seatId: caller.seatId, executionId: caller.executionId };
+const selectorShape = { crew: z.string().min(1).optional(), profile: z.string().min(1).optional(),
+  project: z.string().refine(isAbsolute, 'project must be an absolute path').optional() };
+const selectorSchema = z.object(selectorShape).strict();
+function querySelector(query: Record<string, string>) {
+  const parsed = selectorSchema.safeParse({ crew: query.crew, profile: query.profile, project: query.project });
+  if (!parsed.success) throw new HTTPException(400, { message: 'Invalid crew, profile, or absolute project selector' });
+  return parsed.data;
 }
+async function selectedCaller(header: string | undefined, requested: RunSelector) {
+  if (header === `Bearer ${token}`) return { crew: requested.project || requested.profile
+    ? await profiles.select(requested) ?? crews.select(requested.crew) : crews.select(requested.crew), seatId: null, executionId: null };
+  const caller = crews.whoami(executionCredential(header));
+  await profiles.assertScope(caller.crew, requested);
+  const current = crews.whoami(executionCredential(header));
+  return { crew: current.crew, seatId: current.seatId, executionId: current.executionId };
+}
+for (const kind of ['features', 'tasks'] as const) {
+  app.get(`/${kind}`, async (context) => {
+    const caller = await selectedCaller(context.req.header('Authorization'), querySelector(context.req.query()));
+    return context.json(kind === 'features' ? work.listFeatures(caller) : work.listTasks(caller, context.req.query('featureId')));
+  });
+  app.get(`/${kind}/:id`, async (context) => {
+    const caller = await selectedCaller(context.req.header('Authorization'), querySelector(context.req.query()));
+    return context.json(kind === 'features' ? work.showFeature(caller, context.req.param('id')) : work.showTask(caller, context.req.param('id')));
+  });
+  app.post(`/${kind}`, async (context) => {
+    if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+    const schema = z.object({ ...selectorShape, ...createRequestSchema.shape,
+      input: kind === 'features' ? featureInputSchema : taskInputSchema }).strict();
+    const parsed = schema.safeParse(await context.req.json());
+    if (!parsed.success) return context.json({ error: parsed.error.message }, 400);
+    const caller = await selectedCaller(context.req.header('Authorization'), parsed.data);
+    return context.json(kind === 'features'
+      ? work.createFeature(caller, featureInputSchema.parse(parsed.data.input), parsed.data.requestId)
+      : work.createTask(caller, taskInputSchema.parse(parsed.data.input), parsed.data.requestId));
+  });
+  for (const action of ['ready', 'pause', 'resume', 'cancel'] as const) {
+    if (kind === 'features' && action === 'ready') continue;
+    app.post(`/${kind}/:id/${action}`, async (context) => {
+      if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+      const parsed = z.object({ ...selectorShape, ...mutationSchema.shape }).strict().safeParse(await context.req.json());
+      if (!parsed.success) return context.json({ error: parsed.error.message }, 400);
+      const caller = await selectedCaller(context.req.header('Authorization'), parsed.data);
+      const mutation = mutationSchema.parse({ requestId: parsed.data.requestId, expectedVersion: parsed.data.expectedVersion, reason: parsed.data.reason });
+      return context.json(kind === 'features'
+        ? work.featureAction(caller, context.req.param('id'), action as 'pause' | 'resume' | 'cancel', mutation)
+        : work.taskAction(caller, context.req.param('id'), action, mutation));
+    });
+  }
+}
+app.post('/features/:id/grant', async (context) => {
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = z.object({ ...selectorShape, ...mutationSchema.shape, input: grantInputSchema }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: parsed.error.message }, 400);
+  const caller = await selectedCaller(context.req.header('Authorization'), parsed.data);
+  return context.json(work.setGrant(caller, context.req.param('id'), parsed.data.input,
+    mutationSchema.parse({ requestId: parsed.data.requestId, expectedVersion: parsed.data.expectedVersion, reason: parsed.data.reason })));
+});
 app.get('/crews', async (context) => {
-  const caller = selectedCaller(context.req.header('Authorization'), context.req.query('crew'));
+  const caller = await selectedCaller(context.req.header('Authorization'), querySelector(context.req.query()));
   return context.json({ ...await crews.status(caller.crew), deliveryIssues: messages.issues(caller) });
 });
 app.post('/crews/down', async (context) => {
   if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
-  const body = await context.req.json();
-  if (typeof body?.crew !== 'string' || !body.crew) return context.json({ error: 'crew is required' }, 400);
-  return context.json(await crews.down(body.crew));
+  const parsed = selectorSchema.safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Invalid crew, profile, or absolute project selector' }, 400);
+  const caller = await selectedCaller(context.req.header('Authorization'), parsed.data);
+  return context.json(await crews.down(caller.crew));
 });
-app.get('/members', async (context) => context.json(await crews.members(selectedCaller(context.req.header('Authorization'), context.req.query('crew')).crew)));
-const submission = z.object({ crew: z.string().min(1).optional(), recipient: z.string().min(1), body: z.string(), requestId: z.string().min(1).max(200) }).strict();
+app.get('/members', async (context) => context.json(await crews.members((await selectedCaller(context.req.header('Authorization'), querySelector(context.req.query()))).crew)));
+const submission = z.object({ ...selectorShape, recipient: z.string().min(1), body: z.string(), requestId: z.string().min(1).max(200) }).strict();
 app.post('/messages', async (context) => {
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
   const parsed = submission.safeParse(await context.req.json());
-  if (!parsed.success) return context.json({ error: 'Expected recipient, body, requestId, and optional crew only' }, 400);
+  if (!parsed.success) return context.json({ error: 'Expected recipient, body, requestId, and optional crew/profile/project selectors only' }, 400);
   const body = parsed.data;
-  const message = messages.send(selectedCaller(context.req.header('Authorization'), body.crew), body.recipient, body.body, body.requestId);
+  const message = messages.send(await selectedCaller(context.req.header('Authorization'), body), body.recipient, body.body, body.requestId);
   return context.json(message);
+});
+app.post('/messages/clear', async (context) => {
+  if (context.req.header('Authorization') !== `Bearer ${token}`) return context.json({ error: 'Unauthorized' }, 401);
+  if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
+  const parsed = selectorSchema.safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected optional crew/profile/project selectors only' }, 400);
+  const caller = await selectedCaller(context.req.header('Authorization'), parsed.data);
+  return context.json(await crews.clearMessages(caller.crew));
 });
 app.post('/messages/:id/retry', async (context) => {
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
-  const parsed = z.object({ crew: z.string().min(1).optional(), allowDuplicate: z.boolean().default(false) }).strict().safeParse(await context.req.json());
-  if (!parsed.success) return context.json({ error: 'Expected boolean allowDuplicate and optional crew only' }, 400);
-  return context.json(messages.retry(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.allowDuplicate));
+  const parsed = z.object({ ...selectorShape, allowDuplicate: z.boolean().default(false) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected boolean allowDuplicate and optional crew/profile/project selectors only' }, 400);
+  return context.json(messages.retry(await selectedCaller(context.req.header('Authorization'), parsed.data), context.req.param('id'), parsed.data.allowDuplicate));
 });
 app.post('/messages/:id/reply', async (context) => {
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
-  const parsed = z.object({ crew: z.string().min(1).optional(), body: z.string(), requestId: z.string().min(1).max(200) }).strict().safeParse(await context.req.json());
-  if (!parsed.success) return context.json({ error: 'Expected body, requestId, and optional crew only' }, 400);
-  const message = messages.reply(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id'), parsed.data.body, parsed.data.requestId);
+  const parsed = z.object({ ...selectorShape, body: z.string(), requestId: z.string().min(1).max(200) }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected body, requestId, and optional crew/profile/project selectors only' }, 400);
+  const message = messages.reply(await selectedCaller(context.req.header('Authorization'), parsed.data), context.req.param('id'), parsed.data.body, parsed.data.requestId);
   return context.json(message);
 });
 app.post('/messages/:id/ack', async (context) => {
   if (stopping) return context.json({ error: 'Daemon is stopping' }, 503);
-  const parsed = z.object({ crew: z.string().min(1).optional() }).strict().safeParse(await context.req.json());
-  if (!parsed.success) return context.json({ error: 'Expected optional crew only' }, 400);
-  return context.json(messages.ack(selectedCaller(context.req.header('Authorization'), parsed.data.crew), context.req.param('id')));
+  const parsed = selectorSchema.safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected optional crew/profile/project selectors only' }, 400);
+  return context.json(messages.ack(await selectedCaller(context.req.header('Authorization'), parsed.data), context.req.param('id')));
 });
-app.get('/messages/:id', (context) => context.json(messages.show(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.param('id'))));
-app.get('/inbox', (context) => context.json(messages.inbox(selectedCaller(context.req.header('Authorization'), context.req.query('crew')), context.req.query('all') === 'true')));
+app.get('/messages/:id', async (context) => context.json(messages.show(await selectedCaller(context.req.header('Authorization'), querySelector(context.req.query())), context.req.param('id'))));
+app.get('/inbox', async (context) => context.json(messages.inbox(await selectedCaller(context.req.header('Authorization'), querySelector(context.req.query())), context.req.query('all') === 'true')));
 app.get('/whoami', (context) => context.json(crews.whoami(executionCredential(context.req.header('Authorization')))));
 app.post('/executions/activity', async (context) => {
   const caller = crews.whoami(executionCredential(context.req.header('Authorization')));
@@ -119,6 +203,13 @@ app.post('/executions/prompt', async (context) => {
   const parsed = z.object({ attemptId: z.string().uuid(), sessionId: z.string(), cwd: z.string(), prompt: z.string(), nativePromptId: z.string().min(1).max(200).optional(), eventAt: z.string().datetime().optional() }).strict().safeParse(await context.req.json());
   if (!parsed.success) return context.json({ error: 'Expected delivery attempt, native session, cwd, and submitted prompt' }, 400);
   return context.json(messages.verifyPrompt(caller, parsed.data));
+});
+app.post('/executions/session', async (context) => {
+  const credential = executionCredential(context.req.header('Authorization'));
+  crews.whoami(credential);
+  const parsed = z.object({ source: z.enum(['clear', 'resume']), sessionId: z.string().uuid(), cwd: z.string() }).strict().safeParse(await context.req.json());
+  if (!parsed.success) return context.json({ error: 'Expected clear/resume source, native session UUID, and cwd' }, 400);
+  return context.json(await crews.sessionStarted(credential, parsed.data.sessionId, parsed.data.cwd, parsed.data.source));
 });
 app.post('/executions/ready', async (context) => {
   const body = await context.req.json();

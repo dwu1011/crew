@@ -5,8 +5,8 @@ import { dirname, join } from 'node:path';
 import { processIdentity } from './process-identity.js';
 import { request } from './client.js';
 
-async function report(path: string, body: unknown) {
-  return request(process.env.CREW_HOME!, path, body, process.env.CREW_EXECUTION_TOKEN!, 2000);
+async function report(path: string, body: unknown, timeoutMs = 2000) {
+  return request(process.env.CREW_HOME!, path, body, process.env.CREW_EXECUTION_TOKEN!, timeoutMs);
 }
 
 if (process.argv[2] === '--hook') {
@@ -38,9 +38,16 @@ if (process.argv[2] === '--hook') {
       }
     }
     const receipt = JSON.parse(contents);
-    if (receipt.nativeSessionId !== event.session_id || receipt.cwd !== event.cwd) throw new Error('Native startup identity mismatch');
-    writeFileSync(join(root, 'ready.json'), JSON.stringify({ generation: receipt.generation, sessionId: event.session_id, cwd: event.cwd, submissionProtocol: 1 }), { mode: 0o600 });
-    await report('/executions/ready', { sessionId: event.session_id, cwd: event.cwd });
+    const transitioning = event.source === 'clear' || event.source === 'resume';
+    if (transitioning) {
+      await report('/executions/session', { source: event.source, sessionId: event.session_id, cwd: event.cwd }, 8000);
+    } else {
+      if (receipt.nativeSessionId !== event.session_id || receipt.cwd !== event.cwd) throw new Error('Native startup identity mismatch');
+    }
+    const marker = join(root, 'ready.json');
+    writeFileSync(`${marker}.tmp`, JSON.stringify({ generation: receipt.generation, sessionId: event.session_id, cwd: event.cwd, submissionProtocol: 1 }), { mode: 0o600 });
+    renameSync(`${marker}.tmp`, marker);
+    if (!transitioning) await report('/executions/ready', { sessionId: event.session_id, cwd: event.cwd });
   }
   if (blockedReason) console.log(JSON.stringify({ decision: 'block', reason: blockedReason, hookSpecificOutput: { hookEventName: 'UserPromptSubmit', suppressOriginalPrompt: true } }));
   else if (!managedPrompt) await report('/executions/activity', { event: hookEvent, eventAt, sessionId: event.session_id, cwd: event.cwd, toolName: event.tool_name }).catch(() => {});

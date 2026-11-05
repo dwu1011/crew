@@ -42,7 +42,7 @@ export class Messages {
 
   send(caller: MessageCaller, recipient: string, body: string, requestId: string) {
     const crewId = this.crew(caller);
-    const seat = this.db.prepare('SELECT id FROM seats WHERE crew_id = ? AND name = ?').get(crewId, recipient) as { id: string } | undefined;
+    const seat = this.db.prepare('SELECT id FROM seats WHERE crew_id = ? AND name = ? AND retired = 0').get(crewId, recipient) as { id: string } | undefined;
     if (!seat) throw new HTTPException(404, { message: 'Unknown recipient seat' });
     return this.persist(caller, seat.id, body, requestId, null);
   }
